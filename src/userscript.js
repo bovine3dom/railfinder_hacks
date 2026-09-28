@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Railfinder route map
 // @namespace    railfinder-hacks
-// @version      0.13.1
+// @version      0.15.0
 // @description  Map Railfinder journey routes.
 // @match        https://www.railfinder.eu/search*
 // @run-at       document-idle
@@ -39,8 +39,10 @@
   let routeLayersByKey = new Map();
   let currentPairFeatures = null;
   let resultsRoot;
+  let resultsPaneTop = 0;
   let originalResultsStyle;
   let originalBodyOverflow;
+  let mapReopenButton;
   let mapPane;
   let mapContainer;
   let mapStatus;
@@ -49,6 +51,8 @@
   let casingLayer;
   let routeLayer;
   let trainLabelLayer;
+  let hoveredLabelRecords = [];
+  let labelLayoutFrame = 0;
   let hoveredJourneyRank = null;
   let mapVisible = false;
   let mapAutoStarted = false;
@@ -56,7 +60,7 @@
   let lastRenderedFeatureSignature = null;
 
   GM_addStyle(GM_getResourceText("LEAFLET_CSS"));
-  GM_addStyle(".railfinder-train-label-icon{background:transparent;border:0}.railfinder-train-label-text{display:inline-block;white-space:nowrap;line-height:1;transform:translate(-50%,-50%);-webkit-text-stroke:3px white;paint-order:stroke fill;text-shadow:0 0 2px white;pointer-events:none}");
+  GM_addStyle(".railfinder-train-label-icon{background:transparent;border:0}.railfinder-map-label{display:inline-block;white-space:nowrap;line-height:1;-webkit-text-stroke:3px white;paint-order:stroke fill;text-shadow:0 0 2px white;pointer-events:none}");
 
   function trackCard(card) {
     journeyCards.add(card);
@@ -120,6 +124,30 @@
     return null;
   }
 
+  function clockTimes(card) {
+    const walker = document.createTreeWalker(card, NodeFilter.SHOW_TEXT);
+    const times = [];
+    while (walker.nextNode()) {
+      const value = walker.currentNode.nodeValue.trim();
+      if (/^\d{1,2}:\d{2}$/.test(value)) times.push({ node: walker.currentNode, value });
+    }
+    return times;
+  }
+
+  function legTimes(info, times) {
+    let departureTime = null;
+    let arrivalTime = null;
+    for (const { node, value } of times) {
+      const position = info.compareDocumentPosition(node);
+      if (position & Node.DOCUMENT_POSITION_PRECEDING) departureTime = value;
+      else if (position & Node.DOCUMENT_POSITION_FOLLOWING) {
+        arrivalTime = value;
+        break;
+      }
+    }
+    return { departureTime, arrivalTime };
+  }
+
   function distanceKm([longitude1, latitude1], [longitude2, latitude2]) {
     const radians = (degrees) => degrees * Math.PI / 180;
     const lat1 = radians(latitude1);
@@ -152,21 +180,25 @@
     return { name, logoUrl };
   }
 
-  function featureFor(card, info, index, transport) {
+  function featureFor(card, info, index, transport, times) {
     const from = parsePoint(info.dataset.departurePoint);
     const to = parsePoint(info.dataset.arrivalPoint);
     if (!from || !to) return null;
 
     const durationSeconds = legDuration(info, card);
+    const { departureTime, arrivalTime } = legTimes(info, times);
     const straightLineDistanceKm = distanceKm(from, to);
     const operator = operatorFor(info, card, transport);
     const properties = {
       journeyRank: rankValue(card.dataset.rank),
+      legIndex: index,
       from: info.dataset.departureStationName || null,
       to: info.dataset.arrivalStationName || null,
       fromStationId: info.dataset.departureStation || null,
       toStationId: info.dataset.arrivalStation || null,
       transport: cleanText(transport),
+      departureTime,
+      arrivalTime,
       operator: operator.name,
       operatorLogoUrl: operator.logoUrl,
       durationSeconds,
@@ -188,8 +220,9 @@
       const infos = card.querySelectorAll(LEG_INFO);
       if (!infos.length) continue;
       const transports = card.querySelectorAll(TRANSPORT_NAME);
+      const times = clockTimes(card);
       infos.forEach((info, index) => {
-        const feature = featureFor(card, info, index, transports[index]);
+        const feature = featureFor(card, info, index, transports[index], times);
         if (feature) features.push(feature);
       });
     }
@@ -239,6 +272,8 @@
           operator: p.operator,
           operatorLogoUrl: p.operatorLogoUrl,
           trainName: trainName(p.transport),
+          departureTime: p.departureTime,
+          arrivalTime: p.arrivalTime,
         });
       }
       const speed = p.straightLineAverageSpeedKmh;
@@ -658,14 +693,94 @@
     return { ...style, color: "#fff", weight: style.weight + 2 };
   }
 
+  function setLabelOffset(element, [x, y]) {
+    element.style.transform = `translate(-50%,-50%) translate(${x}px,${y}px)`;
+  }
+
+  function layoutHoveredLabels() {
+    if (!trainLabelLayer) return;
+    const labels = hoveredLabelRecords.map((label) => ({
+      ...label,
+      rect: label.element.getBoundingClientRect(),
+    }));
+    const placed = [];
+    for (const label of labels) {
+      const { element, offsets, currentOffset, rect } = label;
+      let bestOffset = offsets[0];
+      let bestRect;
+      let fewestCollisions = Infinity;
+      for (const offset of offsets) {
+        const dx = offset[0] - currentOffset[0];
+        const dy = offset[1] - currentOffset[1];
+        const candidate = {
+          left: rect.left + dx,
+          right: rect.right + dx,
+          top: rect.top + dy,
+          bottom: rect.bottom + dy,
+        };
+        const collisions = placed.reduce((count, other) => count + (
+          candidate.left < other.right + 4 && candidate.right + 4 > other.left
+          && candidate.top < other.bottom + 4 && candidate.bottom + 4 > other.top ? 1 : 0
+        ), 0);
+        if (collisions < fewestCollisions) {
+          bestOffset = offset;
+          bestRect = candidate;
+          fewestCollisions = collisions;
+        }
+        if (collisions === 0) break;
+      }
+      setLabelOffset(element, bestOffset);
+      label.currentOffset = bestOffset;
+      placed.push(bestRect);
+    }
+  }
+
+  function scheduleLabelLayout() {
+    if (!trainLabelLayer || labelLayoutFrame) return;
+    labelLayoutFrame = requestAnimationFrame(() => {
+      labelLayoutFrame = 0;
+      layoutHoveredLabels();
+    });
+  }
+
   function renderHoveredTrainLabels() {
     if (trainLabelLayer) routeMap.removeLayer(trainLabelLayer);
     trainLabelLayer = null;
+    hoveredLabelRecords = [];
     if (!routeMap || !routeLayer || hoveredJourneyRank === null) return;
 
     const transport = document.querySelector(TRANSPORT_NAME);
     const font = getComputedStyle(transport || resultsRoot || document.body);
     const labels = L.layerGroup();
+    const addLabel = (value, point, color, offsets, multiline = false) => {
+      if (!value || !point) return;
+      const text = document.createElement("span");
+      text.className = "railfinder-map-label";
+      text.textContent = value;
+      text.style.fontFamily = font.fontFamily;
+      text.style.fontSize = font.fontSize;
+      text.style.fontWeight = font.fontWeight;
+      text.style.color = color;
+      text.style.textAlign = "center";
+      text.style.whiteSpace = multiline ? "pre" : "nowrap";
+      setLabelOffset(text, offsets[0]);
+      const icon = L.divIcon({
+        className: "railfinder-train-label-icon",
+        html: text,
+        iconSize: [1, 1],
+        iconAnchor: [0, 0],
+      });
+      labels.addLayer(L.marker(point, { icon, interactive: false, keyboard: false }));
+      hoveredLabelRecords.push({ element: text, offsets, currentOffset: offsets[0] });
+    };
+    const addStationLabel = (name, point, times) => {
+      if (!name) return;
+      const timeText = times.filter(Boolean).join(" ");
+      addLabel(`${name}${timeText ? `\n${timeText}` : ""}`, point, "#172554", [
+        [0, -24], [0, -44], [24, -24], [-24, -24], [24, 24], [-24, 24], [0, 44],
+      ], Boolean(timeText));
+    };
+
     routeLayer.eachLayer((layer) => {
       const feature = layer.feature;
       if (!isHoveredFeature(feature)) return;
@@ -674,25 +789,64 @@
       );
       if (!journey?.trainName) return;
       const points = layer.getLatLngs();
-      const point = points[Math.floor(points.length / 2)];
+      const middle = Math.floor(points.length / 2);
+      const point = points[middle];
       if (!point) return;
-
-      const text = document.createElement("span");
-      text.className = "railfinder-train-label-text";
-      text.textContent = journey.trainName;
-      text.style.fontFamily = font.fontFamily;
-      text.style.fontSize = font.fontSize;
-      text.style.fontWeight = font.fontWeight;
-      text.style.color = featureStyle(feature).color;
-      const icon = L.divIcon({
-        className: "railfinder-train-label-icon",
-        html: text,
-        iconSize: [1, 1],
-        iconAnchor: [0, 0],
-      });
-      labels.addLayer(L.marker(point, { icon, interactive: false, keyboard: false }));
+      const before = routeMap.latLngToLayerPoint(points[Math.max(0, middle - 1)]);
+      const after = routeMap.latLngToLayerPoint(points[Math.min(points.length - 1, middle + 1)]);
+      const dx = after.x - before.x;
+      const dy = after.y - before.y;
+      const length = Math.hypot(dx, dy) || 1;
+      const side = hoveredJourneyRank % 2 ? 1 : -1;
+      const normalX = -dy / length * side;
+      const normalY = dx / length * side;
+      const tangentX = dx / length;
+      const tangentY = dy / length;
+      const offsets = [16, 32, 48].map((distance) => [
+        normalX * distance,
+        normalY * distance,
+      ]);
+      for (const shift of [-48, -24, 24, 48]) {
+        offsets.push([normalX * 16 + tangentX * shift, normalY * 16 + tangentY * shift]);
+      }
+      addLabel(journey.trainName, point, featureStyle(feature).color, offsets);
     });
-    if (labels.getLayers().length) trainLabelLayer = labels.addTo(routeMap);
+
+    const legs = currentFeatures()
+      .filter((feature) => feature.properties.journeyRank === hoveredJourneyRank)
+      .sort((a, b) => a.properties.legIndex - b.properties.legIndex);
+    if (legs.length) {
+      const first = legs[0];
+      const [startLongitude, startLatitude] = first.geometry.coordinates[0];
+      addStationLabel(first.properties.from, L.latLng(startLatitude, startLongitude), [
+        first.properties.departureTime && `dep: ${first.properties.departureTime}`,
+      ]);
+      const last = legs.at(-1);
+      const [endLongitude, endLatitude] = last.geometry.coordinates.at(-1);
+      addStationLabel(last.properties.to, L.latLng(endLatitude, endLongitude), [
+        last.properties.arrivalTime && `arr: ${last.properties.arrivalTime}`,
+      ]);
+    }
+    for (let index = 0; index < legs.length - 1; index += 1) {
+      const leg = legs[index];
+      const next = legs[index + 1];
+      const sameStation = (leg.properties.toStationId && next.properties.fromStationId
+        && leg.properties.toStationId === next.properties.fromStationId)
+        || leg.properties.to === next.properties.from;
+      const stationName = sameStation
+        ? leg.properties.to
+        : [leg.properties.to, next.properties.from].filter(Boolean).join(" → ");
+      if (!stationName) continue;
+      const [longitude, latitude] = leg.geometry.coordinates.at(-1);
+      addStationLabel(stationName, L.latLng(latitude, longitude), [
+        leg.properties.arrivalTime && `arr: ${leg.properties.arrivalTime}`,
+        next.properties.departureTime && `dep: ${next.properties.departureTime}`,
+      ]);
+    }
+    if (labels.getLayers().length) {
+      trainLabelLayer = labels.addTo(routeMap);
+      scheduleLabelLayout();
+    }
   }
 
   function setHoveredRoute(rank) {
@@ -744,6 +898,7 @@
     const collection = { type: "FeatureCollection", features };
     casingLayer = L.geoJSON(collection, {
       style: casingStyle,
+      smoothFactor: 3,
       interactive: false,
       onEachFeature: (feature, layer) => {
         routeLayersByKey.set(railRouteKey(feature), { casing: layer });
@@ -751,6 +906,7 @@
     }).addTo(routeMap);
     routeLayer = L.geoJSON(collection, {
       style: featureStyle,
+      smoothFactor: 3,
       onEachFeature: (feature, layer) => {
         layer.bindPopup(makePopup(feature));
         const key = railRouteKey(feature);
@@ -772,39 +928,67 @@
     }
   }
 
+  function restoreResultsPane() {
+    if (!resultsRoot) return;
+    if (originalResultsStyle === null) resultsRoot.removeAttribute("style");
+    else resultsRoot.setAttribute("style", originalResultsStyle);
+  }
+
   function resizeMapPane() {
     if (!mapVisible || !resultsRoot || !mapPane) return;
     const wide = window.matchMedia("(min-width: 1100px)").matches;
-    Object.assign(resultsRoot.style, {
-      position: "fixed",
-      inset: "0 auto auto 0",
-      width: wide ? "50vw" : "100vw",
-      height: wide ? "100vh" : "50vh",
-      minHeight: "0",
-      boxSizing: "border-box",
-      overflowY: "auto",
-      overflowX: "hidden",
-      zIndex: "2147483645",
+    if (wide) {
+      const top = Math.min(resultsPaneTop, Math.max(0, window.innerHeight - 240));
+      Object.assign(resultsRoot.style, {
+        display: "block",
+        position: "fixed",
+        inset: `${top}px auto auto 0`,
+        width: "50vw",
+        height: `calc(100vh - ${top}px)`,
+        minHeight: "0",
+        boxSizing: "border-box",
+        overflowY: "auto",
+        overflowX: "hidden",
+        zIndex: "2147483645",
+      });
+      Object.assign(mapPane.style, {
+        position: "fixed",
+        inset: `${top}px 0 0 50vw`,
+        width: "50vw",
+        height: `calc(100vh - ${top}px)`,
+        borderLeft: "1px solid #cbd5e1",
+        borderTop: "none",
+        zIndex: "2147483646",
+      });
+      document.body.style.overflow = "hidden";
+    } else {
+      restoreResultsPane();
+      document.body.style.overflow = originalBodyOverflow;
+      Object.assign(mapPane.style, {
+        position: "fixed",
+        inset: "auto 0 0 0",
+        width: "100vw",
+        height: "50vh",
+        borderLeft: "none",
+        borderTop: "1px solid #cbd5e1",
+        zIndex: "2147483646",
+      });
+    }
+    if (routeMap) requestAnimationFrame(() => {
+      routeMap.invalidateSize();
+      scheduleLabelLayout();
     });
-    Object.assign(mapPane.style, {
-      position: "fixed",
-      inset: wide ? "0 0 0 50vw" : "auto 0 0 0",
-      width: wide ? "50vw" : "100vw",
-      height: wide ? "100vh" : "50vh",
-      borderLeft: wide ? "1px solid #cbd5e1" : "none",
-      borderTop: wide ? "none" : "1px solid #cbd5e1",
-      zIndex: "2147483646",
-    });
-    if (routeMap) requestAnimationFrame(() => routeMap.invalidateSize());
   }
 
   function mountMapPane() {
     if (resultsRoot) return true;
     const card = [...journeyCards].find((item) => item.isConnected);
-    resultsRoot = document.querySelector('[data-controller~="filter"]')
-      || card?.closest('[data-controller~="filter"]');
+    resultsRoot = document.querySelector("#results")
+      || card?.closest('[data-filter-target~="elementContainer"]')
+      || document.querySelector('[data-filter-target~="elementContainer"]');
     if (!resultsRoot) return false;
 
+    resultsPaneTop = Math.max(0, resultsRoot.getBoundingClientRect().top);
     originalResultsStyle = resultsRoot.getAttribute("style");
     originalBodyOverflow = document.body.style.overflow;
     document.body.append(mapPane);
@@ -814,13 +998,19 @@
   function closeMapPane() {
     mapVisible = false;
     mapPane.style.display = "none";
-    if (resultsRoot) {
-      if (originalResultsStyle === null) resultsRoot.removeAttribute("style");
-      else resultsRoot.setAttribute("style", originalResultsStyle);
-    }
+    restoreResultsPane();
     document.body.style.overflow = originalBodyOverflow;
     window.removeEventListener("resize", resizeMapPane);
     cancelQueuedRoutes();
+    if (!mapReopenButton) {
+      mapReopenButton = document.createElement("button");
+      mapReopenButton.type = "button";
+      mapReopenButton.textContent = "Open route map";
+      mapReopenButton.style.cssText = "position:fixed;right:16px;bottom:16px;z-index:2147483647;padding:8px 12px;border:1px solid #64748b;border-radius:6px;background:white;box-shadow:0 2px 8px #0003;cursor:pointer";
+      mapReopenButton.addEventListener("click", openMap);
+      document.body.append(mapReopenButton);
+    }
+    mapReopenButton.hidden = false;
   }
 
   function createMapPane() {
@@ -857,10 +1047,11 @@
   function openMap() {
     if (!mapPane) createMapPane();
     if (!mountMapPane()) return false;
+    resultsPaneTop = Math.max(0, resultsRoot.getBoundingClientRect().top);
+    mapReopenButton && (mapReopenButton.hidden = true);
     mapAutoStarted = true;
     mapVisible = true;
     mapPane.style.display = "flex";
-    document.body.style.overflow = "hidden";
     window.addEventListener("resize", resizeMapPane);
     resizeMapPane();
     requestAnimationFrame(() => {
@@ -870,6 +1061,7 @@
       }
       if (!routeMap) {
         routeMap = L.map(mapContainer, { preferCanvas: true });
+        routeMap.on("zoomend moveend", scheduleLabelLayout);
         routeMap.getPane("tilePane").style.filter = "saturate(0)";
         L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", {
           maxZoom: 19,
@@ -881,6 +1073,7 @@
         routeMap.setView([51, 7], 5);
       }
       routeMap.invalidateSize();
+      scheduleLabelLayout();
       renderMap(true);
     });
     return true;
@@ -931,6 +1124,7 @@
   let mapUpdateTimer;
   observer.observe(document.documentElement, {
     childList: true,
+    characterData: true,
     subtree: true,
     attributes: true,
     attributeFilter: [
