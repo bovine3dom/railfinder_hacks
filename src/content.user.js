@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Railfinder route map
 // @namespace    railfinder-hacks
-// @version      0.17.3
+// @version      0.18.1
 // @author       bovine3dom
 // @description  map for railfinder.eu search results
 // @match        https://www.railfinder.eu/search*
@@ -22,12 +22,10 @@
   const TRANSPORT_NAME = ".travel-leg-transport-name";
   const OPEN_RAIL_ROUTING_URL = "https://routing.openrailrouting.org/route";
   const ROUTE_PROFILE = "all_tracks";
-  const ROUTE_CACHE_PREFIX = "railfinder.openrailrouting.v1:";
+  const ROUTE_CACHE_PREFIX = "railfinder.openrailrouting.v2:";
   const ROUTE_MAX_RETRIES = 2;
   const MAX_CONCURRENT_ROUTE_REQUESTS = 3;
   const ROUTE_TIMEOUT_MS = 20000;
-  const ROUTE_DEFAULT_CACHE_MS = 7 * 24 * 60 * 60 * 1000;
-  const ROUTE_MAX_CACHE_MS = 30 * 24 * 60 * 60 * 1000;
   const journeyCards = new Set();
   const hoverTrackedCards = new WeakSet();
   let mapLeaveTimer;
@@ -36,6 +34,8 @@
   const logoColorPromises = new Map();
   const logoColors = new Map();
   const routeGeometryCache = new Map();
+  let routeDatabasePromise;
+  let cacheWarningShown = false;
   const displayRouteCache = new Map();
   const pendingRouteRequests = new Map();
   const routeFailures = new Map();
@@ -45,7 +45,6 @@
   let routeServiceBlockedReason = null;
   let nextRouteRequestAt = 0;
   let routeLayersByKey = new Map();
-  let currentPairFeatures = null;
   let pageRoot;
   let mapReopenButton;
   let mapPane;
@@ -61,6 +60,7 @@
   let mapAutoStarted = false;
   let mapHasFittedData = false;
   let lastRenderedFeatureSignature = null;
+  let renderGeneration = 0;
 
   GM_addStyle(GM_getResourceText("LEAFLET_CSS"));
   GM_addStyle(`
@@ -257,7 +257,7 @@
 
   function stationPairKey(feature) {
     const p = feature.properties;
-    return JSON.stringify([p.fromStationId || p.from, p.toStationId || p.to]);
+    return JSON.stringify([p.fromStationId || p.from, p.toStationId || p.to].sort());
   }
 
   function consolidateByStationPair(features) {
@@ -279,6 +279,7 @@
               count: 0,
               maxStraightLineAverageSpeedKmh: null,
               routeKey: railRouteKey(feature),
+              routeEnds: routeEnds(feature),
               operatorsByJourney: [],
             },
           },
@@ -397,18 +398,29 @@
     });
   }
 
-  function railRouteKey(feature) {
+  function routeEnds(feature) {
     const p = feature.properties;
-    if (p.routeKey) return p.routeKey;
+    if (p.routeEnds) return p.routeEnds;
     const coordinates = feature.geometry.coordinates;
-    const endpoints = [coordinates[0], coordinates[coordinates.length - 1]]
-      .map(([lon, lat]) => [lon.toFixed(5), lat.toFixed(5)]);
-    return ROUTE_CACHE_PREFIX + encodeURIComponent(JSON.stringify([
-      ROUTE_PROFILE,
-      p.fromStationId || p.from,
-      p.toStationId || p.to,
-      endpoints,
-    ]));
+    return p.fromStationId && p.toStationId
+      ? [p.fromStationId, p.toStationId]
+      : [coordinates[0], coordinates.at(-1)];
+  }
+
+  function routeIsReversed(feature) {
+    const [from, to] = routeEnds(feature);
+    return JSON.stringify(from) > JSON.stringify(to);
+  }
+
+  function railRouteKey(feature) {
+    if (feature.properties.routeKey) return feature.properties.routeKey;
+    const ends = [...routeEnds(feature)];
+    if (routeIsReversed(feature)) ends.reverse();
+    return ROUTE_CACHE_PREFIX + encodeURIComponent(JSON.stringify([ROUTE_PROFILE, ends]));
+  }
+
+  function orientRoute(feature, coordinates) {
+    return routeIsReversed(feature) ? coordinates.slice().reverse() : coordinates;
   }
 
   function validRouteCoordinates(coordinates) {
@@ -418,7 +430,8 @@
         && Math.abs(point[0]) <= 180 && Math.abs(point[1]) <= 90);
   }
 
-  function displayRouteCoordinates(key, coordinates) {
+  function displayRouteCoordinates(feature, coordinates) {
+    const key = railRouteKey(feature) + (routeIsReversed(feature) ? ":reverse" : ":forward");
     if (displayRouteCache.has(key)) return displayRouteCache.get(key);
     const points = coordinates.map((coordinate) => {
       const point = routeMap.project([coordinate[1], coordinate[0]], 14);
@@ -430,44 +443,81 @@
     return simplified;
   }
 
-  function cachedRouteCoordinates(key) {
-    if (routeGeometryCache.has(key)) return routeGeometryCache.get(key);
-    try {
-      const item = JSON.parse(localStorage.getItem(key));
-      if (item?.expiresAt > Date.now() && validRouteCoordinates(item.coordinates)) {
-        routeGeometryCache.set(key, item.coordinates);
-        return item.coordinates;
+  function routeDatabase() {
+    routeDatabasePromise ??= new Promise((resolve) => {
+      let request;
+      try {
+        request = indexedDB.open("railfinder-hacks-openrailrouting", 1);
+      } catch {
+        resolve(null);
+        return;
       }
-      if (item) localStorage.removeItem(key);
-    } catch {
-      // Ignore unavailable or invalid local storage entries.
-    }
-    return null;
+      let blocked = false;
+      request.onupgradeneeded = () => request.result.createObjectStore("routes");
+      request.onerror = () => resolve(null);
+      request.onblocked = () => { blocked = true; resolve(null); };
+      request.onsuccess = () => {
+        const db = request.result;
+        if (blocked) return db.close();
+        db.onversionchange = () => { db.close(); routeDatabasePromise = null; };
+        resolve(db);
+      };
+    });
+    return routeDatabasePromise;
   }
 
-  function routeCacheLifetime(headers) {
-    const directives = headers.get("Cache-Control") || "";
-    if (/\bno-store\b|\bno-cache\b/i.test(directives)) return 0;
-    const age = Math.max(0, Number(headers.get("Age")) || 0) * 1000;
-    const maxAge = directives.match(/(?:^|,)\s*max-age\s*=\s*"?(\d+)/i);
-    let lifetime = maxAge
-      ? Number(maxAge[1]) * 1000 - age
-      : Date.parse(headers.get("Expires") || "") - Date.now() - age;
-    if (!Number.isFinite(lifetime)) lifetime = ROUTE_DEFAULT_CACHE_MS;
-    return Math.max(0, Math.min(lifetime, ROUTE_MAX_CACHE_MS));
-  }
-
-  function storeRouteCoordinates(key, coordinates, headers) {
-    const lifetime = routeCacheLifetime(headers);
-    if (!lifetime) return;
-    routeGeometryCache.set(key, coordinates);
+  async function databaseRouteCoordinates(db, key) {
+    if (!db) return null;
     try {
-      localStorage.setItem(key, JSON.stringify({
-        expiresAt: Date.now() + lifetime,
-        coordinates,
-      }));
+      return await new Promise((resolve, reject) => {
+        const request = db.transaction("routes").objectStore("routes").get(key);
+        request.onsuccess = () => resolve(request.result);
+        request.onerror = () => reject(request.error);
+      });
     } catch {
-      // Keep the route in memory if local storage is full or blocked.
+      return null;
+    }
+  }
+
+  async function storedRouteCoordinates(key, feature) {
+    if (!routeGeometryCache.has(key)) {
+      const db = await routeDatabase();
+      let coordinates = await databaseRouteCoordinates(db, key);
+      if (!validRouteCoordinates(coordinates)) {
+        try { coordinates = JSON.parse(localStorage.getItem(key)); } catch { /* Storage can be blocked. */ }
+        if (!validRouteCoordinates(coordinates)) return null;
+        if (db) await storeRouteCoordinates(key, coordinates);
+      }
+      routeGeometryCache.set(key, coordinates);
+    }
+    return orientRoute(feature, routeGeometryCache.get(key));
+  }
+
+  async function storeRouteCoordinates(key, coordinates) {
+    routeGeometryCache.set(key, coordinates);
+    const db = await routeDatabase();
+    if (db) {
+      try {
+        const saved = await new Promise((resolve) => {
+          const transaction = db.transaction("routes", "readwrite");
+          transaction.oncomplete = () => resolve(true);
+          transaction.onerror = transaction.onabort = () => resolve(false);
+          transaction.objectStore("routes").put(coordinates, key);
+        });
+        if (saved) return true;
+      } catch {
+        // Fall back to local storage if the database cannot accept writes.
+      }
+    }
+    try {
+      localStorage.setItem(key, JSON.stringify(coordinates));
+      return true;
+    } catch {
+      if (!cacheWarningShown) {
+        console.warn("Railfinder route map: Route storage is unavailable; routes may be fetched again.");
+        cacheWarningShown = true;
+      }
+      return false;
     }
   }
 
@@ -542,7 +592,7 @@
             return null;
           }
           if (!validRouteCoordinates(coordinates)) return null;
-          return { coordinates: coordinates.map(([lon, lat]) => [lon, lat]), headers: response.headers };
+          return coordinates.map(([lon, lat]) => [lon, lat]);
         }
       } catch (error) {
         if (error instanceof TypeError || error instanceof SyntaxError) {
@@ -571,20 +621,6 @@
     return null;
   }
 
-  function updateRoutingStatus() {
-    if (!currentPairFeatures?.length) return;
-    if (routeServiceBlockedReason) {
-      return;
-    }
-    let ready = 0;
-    let pending = 0;
-    for (const feature of currentPairFeatures) {
-      const key = railRouteKey(feature);
-      if (cachedRouteCoordinates(key)) ready += 1;
-      else if (pendingRouteRequests.has(key)) pending += 1;
-    }
-  }
-
   function processRouteQueue() {
     if (routeServiceBlockedReason) return cancelQueuedRoutes();
     if (!routeQueue.length || activeRouteRequests >= MAX_CONCURRENT_ROUTE_REQUESTS) return;
@@ -603,11 +639,11 @@
     while (routeQueue.length && activeRouteRequests < MAX_CONCURRENT_ROUTE_REQUESTS) {
       const job = routeQueue.shift();
       activeRouteRequests += 1;
-      fetchRailRoute(job.feature).then((result) => {
-        if (result) {
-          storeRouteCoordinates(job.key, result.coordinates, result.headers);
+      fetchRailRoute(job.feature).then(async (coordinates) => {
+        if (coordinates) {
+          await storeRouteCoordinates(job.key, orientRoute(job.feature, coordinates));
           routeFailures.delete(job.key);
-          job.resolve(result.coordinates);
+          job.resolve(coordinates);
         } else {
           routeFailures.set(job.key, Date.now() + 10 * 60 * 1000);
           job.resolve(null);
@@ -616,23 +652,17 @@
         routeFailures.set(job.key, Date.now() + 10 * 60 * 1000);
         job.resolve(null);
       }).finally(() => {
-        pendingRouteRequests.delete(job.key);
         activeRouteRequests -= 1;
         if (routeServiceBlockedReason) cancelQueuedRoutes();
-        updateRoutingStatus();
         processRouteQueue();
       });
     }
   }
 
   function requestRailRoute(feature) {
-    if (routeServiceBlockedReason) return Promise.resolve(null);
+    if (routeServiceBlockedReason) return;
     const key = railRouteKey(feature);
-    const cached = cachedRouteCoordinates(key);
-    if (cached) return Promise.resolve(cached);
-    if (pendingRouteRequests.has(key)) return pendingRouteRequests.get(key);
-    if ((routeFailures.get(key) || 0) > Date.now()) return Promise.resolve(null);
-
+    if (pendingRouteRequests.has(key) || (routeFailures.get(key) || 0) > Date.now()) return;
     const promise = new Promise((resolve) => {
       const [from, to] = feature.geometry.coordinates;
       routeQueue.push({ key, feature, resolve, priority: feature.properties.count * distanceKm(from, to) });
@@ -641,7 +671,8 @@
     promise.then((coordinates) => {
       const layer = routeLayersByKey.get(key);
       if (coordinates && layer && mapVisible) {
-        const display = displayRouteCoordinates(key, coordinates);
+        const directed = orientRoute(layer.line.feature, routeGeometryCache.get(key));
+        const display = displayRouteCoordinates(layer.line.feature, directed);
         const latLngs = display.map(([lon, lat]) => [lat, lon]);
         for (const route of [layer.line, layer.casing]) {
           route.feature.geometry.coordinates = display;
@@ -652,8 +683,7 @@
           renderHoveredTrainLabels();
         }
       }
-      updateRoutingStatus();
-    });
+    }).finally(() => pendingRouteRequests.delete(key));
     return promise;
   }
 
@@ -661,7 +691,6 @@
     if (routeQueueTimer) window.clearTimeout(routeQueueTimer);
     routeQueueTimer = null;
     for (const job of routeQueue.splice(0)) {
-      pendingRouteRequests.delete(job.key);
       job.resolve(null);
     }
   }
@@ -889,8 +918,9 @@
     renderHoveredTrainLabels();
   }
 
-  function renderMap(forceFit = false) {
+  async function renderMap(forceFit = false) {
     if (!routeMap) return;
+    const generation = ++renderGeneration;
     if (hoveredJourneyRank !== null && !cardForRank(hoveredJourneyRank)) setHoveredRoute(null);
     const features = consolidateByStationPair(currentFeatures());
     const signature = JSON.stringify(features.map((feature) => [railRouteKey(feature), feature.properties]));
@@ -901,21 +931,20 @@
       }
       return;
     }
+    const cached = await Promise.all(features.map((feature) => storedRouteCoordinates(railRouteKey(feature), feature)));
+    if (generation !== renderGeneration || !mapVisible) return;
     lastRenderedFeatureSignature = signature;
     if (casingLayer) routeMap.removeLayer(casingLayer);
     if (routeLayer) routeMap.removeLayer(routeLayer);
     casingLayer = routeLayer = null;
     renderHoveredTrainLabels();
     routeLayersByKey = new Map();
-    currentPairFeatures = features;
-    for (const feature of features) {
-      const cached = cachedRouteCoordinates(railRouteKey(feature));
-      if (cached) feature.geometry.coordinates = displayRouteCoordinates(railRouteKey(feature), cached);
-    }
-    if (!features.length) {
-      updateRoutingStatus();
-      return;
-    }
+    features.forEach((feature, index) => {
+      if (cached[index]) {
+        feature.geometry.coordinates = displayRouteCoordinates(feature, cached[index]);
+      }
+    });
+    if (!features.length) return;
 
     const collection = { type: "FeatureCollection", features };
     casingLayer = L.geoJSON(collection, {
@@ -955,8 +984,7 @@
     }).addTo(routeMap);
     warmLogoColors(features);
     if (hoveredJourneyRank !== null) setHoveredRoute(hoveredJourneyRank, true);
-    features.forEach((feature) => requestRailRoute(feature));
-    updateRoutingStatus();
+    features.forEach((feature, index) => { if (!cached[index]) requestRailRoute(feature); });
     processRouteQueue();
 
     const bounds = routeLayer.getBounds();
