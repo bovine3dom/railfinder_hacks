@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Railfinder route map
 // @namespace    railfinder-hacks
-// @version      0.18.1
+// @version      0.18.2
 // @author       bovine3dom
 // @description  map for railfinder.eu search results
 // @match        https://www.railfinder.eu/search*
@@ -18,6 +18,7 @@
 (() => {
   "use strict";
 
+  // {{{ Styles and state
   const LEG_INFO = ".travel-leg-info";
   const TRANSPORT_NAME = ".travel-leg-transport-name";
   const OPEN_RAIL_ROUTING_URL = "https://routing.openrailrouting.org/route";
@@ -26,41 +27,17 @@
   const ROUTE_MAX_RETRIES = 2;
   const MAX_CONCURRENT_ROUTE_REQUESTS = 3;
   const ROUTE_TIMEOUT_MS = 20000;
-  const journeyCards = new Set();
-  const hoverTrackedCards = new WeakSet();
-  let mapLeaveTimer;
-  let selectedCard;
-  let resultsRoot;
-  const logoColorPromises = new Map();
-  const logoColors = new Map();
-  const routeGeometryCache = new Map();
-  let routeDatabasePromise;
-  let cacheWarningShown = false;
-  const displayRouteCache = new Map();
-  const pendingRouteRequests = new Map();
-  const routeFailures = new Map();
-  const routeQueue = [];
-  let activeRouteRequests = 0;
-  let routeQueueTimer = null;
-  let routeServiceBlockedReason = null;
-  let nextRouteRequestAt = 0;
-  let routeLayersByKey = new Map();
-  let pageRoot;
-  let mapReopenButton;
-  let mapPane;
-  let mapContainer;
-  let routeMap;
-  let casingLayer;
-  let routeLayer;
-  let trainLabelLayer;
-  let hoveredLabelRecords = [];
-  let labelLayoutFrame = 0;
-  let hoveredJourneyRank = null;
-  let mapVisible = false;
-  let mapAutoStarted = false;
-  let mapHasFittedData = false;
-  let lastRenderedFeatureSignature = null;
-  let renderGeneration = 0;
+  const journeyCards = new Set(), hoverTrackedCards = new WeakSet();
+  const logoColorPromises = new Map(), logoColors = new Map();
+  const routeGeometryCache = new Map(), displayRouteCache = new Map();
+  const pendingRouteRequests = new Map(), routeFailures = new Map(), routeQueue = [];
+  let routeDatabasePromise, mapLeaveTimer, selectedCard, resultsRoot, pageRoot;
+  let mapReopenButton, mapPane, mapContainer, routeMap, casingLayer, routeLayer, trainLabelLayer;
+  let cacheWarningShown = false, activeRouteRequests = 0, routeQueueTimer = null;
+  let routeServiceBlockedReason = null, nextRouteRequestAt = 0, routeLayersByKey = new Map();
+  let hoveredLabelRecords = [], labelLayoutFrame = 0, hoveredJourneyRank = null;
+  let mapVisible = false, mapAutoStarted = false, mapHasFittedData = false;
+  let lastRenderedFeatureSignature = null, renderGeneration = 0;
 
   GM_addStyle(GM_getResourceText("LEAFLET_CSS"));
   GM_addStyle(`
@@ -82,42 +59,35 @@
       .railfinder-route-pane{inset:auto 0 0;width:100vw;height:50vh;border-left:0;border-top:1px solid #ffd5bd}
     }
   `);
+  // }}}
 
+  // {{{ Journey data
   function trackCard(card) {
     journeyCards.add(card);
     if (hoverTrackedCards.has(card)) return;
     hoverTrackedCards.add(card);
-    card.addEventListener("mouseenter", () => {
-      if (mapVisible) setHoveredRoute(card.dataset.rank);
-    });
+    card.addEventListener("mouseenter", () => { if (mapVisible) setHoveredRoute(card.dataset.rank); });
   }
-
   function rememberCards(node) {
     if (!(node instanceof Element)) return;
     if (node.matches("[data-rank]")) trackCard(node);
     node.querySelectorAll("[data-rank]").forEach(trackCard);
   }
-
   function parsePoint(value) {
     const values = value?.trim().split(/\s+/).map(Number);
-    if (!values || values.length !== 2) return null;
-
-    const [latitude, longitude] = values;
-    if (!Number.isFinite(latitude) || !Number.isFinite(longitude)) return null;
-    if (Math.abs(latitude) > 90 || Math.abs(longitude) > 180) return null;
-    return [longitude, latitude];
+    if (values?.length !== 2) return null;
+    const [lat, lon] = values;
+    return Number.isFinite(lat) && Number.isFinite(lon) && Math.abs(lat) <= 90 && Math.abs(lon) <= 180
+      ? [lon, lat] : null;
   }
-
   function parseDuration(value) {
     const match = value.trim().match(
       /^(?:(\d+)\s*d(?:ays?)?)?\s*(?:(\d+)\s*h(?:ours?)?)?\s*(?:(\d+)\s*m(?:in(?:utes?)?)?)?$/i,
     );
     if (!match || !match.slice(1).some(Boolean)) return null;
-
     const [, days = "0", hours = "0", minutes = "0"] = match;
     return Number(days) * 86400 + Number(hours) * 3600 + Number(minutes) * 60;
   }
-
   function durationIn(element) {
     const walker = document.createTreeWalker(element, NodeFilter.SHOW_TEXT);
     while (walker.nextNode()) {
@@ -126,127 +96,83 @@
     }
     return null;
   }
-
   function legScope(info, card) {
     // Find the closest container that holds this leg's info and transport name.
-    for (let element = info.parentElement; element && element !== card; element = element.parentElement) {
-      if (element.querySelectorAll(LEG_INFO).length === 1
-        && element.querySelectorAll(TRANSPORT_NAME).length === 1) return element;
+    for (let el = info.parentElement; el && el !== card; el = el.parentElement) {
+      if (el.querySelectorAll(LEG_INFO).length === 1 && el.querySelectorAll(TRANSPORT_NAME).length === 1) return el;
     }
     return null;
   }
-
   function legDuration(info, card) {
-    for (let element = info.parentElement; element && element !== card; element = element.parentElement) {
-      if (element.querySelectorAll(LEG_INFO).length !== 1
-        || element.querySelectorAll(TRANSPORT_NAME).length !== 1) continue;
-      const seconds = durationIn(element);
+    for (let el = info.parentElement; el && el !== card; el = el.parentElement) {
+      if (el.querySelectorAll(LEG_INFO).length !== 1 || el.querySelectorAll(TRANSPORT_NAME).length !== 1) continue;
+      const seconds = durationIn(el);
       if (seconds !== null) return seconds;
     }
     return null;
   }
-
   function clockTimes(card) {
-    const walker = document.createTreeWalker(card, NodeFilter.SHOW_TEXT);
-    const times = [];
+    const walker = document.createTreeWalker(card, NodeFilter.SHOW_TEXT), times = [];
     while (walker.nextNode()) {
       const value = walker.currentNode.nodeValue.trim();
       if (/^\d{1,2}:\d{2}$/.test(value)) times.push({ node: walker.currentNode, value });
     }
     return times;
   }
+  const legTimes = (info, times) => ({
+    departureTime: times.findLast(({ node }) =>
+      info.compareDocumentPosition(node) & Node.DOCUMENT_POSITION_PRECEDING)?.value ?? null,
+    arrivalTime: times.find(({ node }) =>
+      info.compareDocumentPosition(node) & Node.DOCUMENT_POSITION_FOLLOWING)?.value ?? null,
+  });
 
-  function legTimes(info, times) {
-    let departureTime = null;
-    let arrivalTime = null;
-    for (const { node, value } of times) {
-      const position = info.compareDocumentPosition(node);
-      if (position & Node.DOCUMENT_POSITION_PRECEDING) departureTime = value;
-      else if (position & Node.DOCUMENT_POSITION_FOLLOWING) {
-        arrivalTime = value;
-        break;
-      }
-    }
-    return { departureTime, arrivalTime };
-  }
-
-  function distanceKm([longitude1, latitude1], [longitude2, latitude2]) {
+  // haversine
+  function distanceKm([lon1, latitude1], [lon2, latitude2]) {
     const radians = (degrees) => degrees * Math.PI / 180;
-    const lat1 = radians(latitude1);
-    const lat2 = radians(latitude2);
-    const deltaLat = lat2 - lat1;
-    const deltaLon = radians(longitude2 - longitude1);
-    const a = Math.min(1, Math.sin(deltaLat / 2) ** 2
-      + Math.cos(lat1) * Math.cos(lat2) * Math.sin(deltaLon / 2) ** 2);
-    return 6371.0088 * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+    const lat1 = radians(latitude1), lat2 = radians(latitude2);
+    const a = Math.min(1, Math.sin((lat2 - lat1) / 2) ** 2
+      + Math.cos(lat1) * Math.cos(lat2) * Math.sin(radians(lon2 - lon1) / 2) ** 2);
+    return 12742.0176 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
   }
-
-  function cleanText(value) {
-    const text = typeof value === "string" ? value : value?.textContent;
-    return text?.replace(/\s+/g, " ").trim() || null;
-  }
-
-  function rankValue(rank) {
-    return Number(rank) || rank;
-  }
-
-  function trainName(transport) {
+  const cleanText = (value) => (typeof value === "string" ? value : value?.textContent)?.replace(/\s+/g, " ").trim() || null;
+  const rankValue = (rank) => Number(rank) || rank;
+  const trainName = (transport) => {
     const name = cleanText(transport);
     return name?.split("•").at(-1).trim() || name;
-  }
-
-  function operatorFor(info, card, transport) {
+  };
+  const operatorFor = (info, card, transport) => {
     const logo = legScope(info, card)?.querySelector("img[alt]");
-    const name = logo?.alt.trim() || cleanText(transport)?.split("•")[0].trim() || null;
-    const logoUrl = logo?.currentSrc || logo?.src || null;
-    return { name, logoUrl };
-  }
-
+    return { name: logo?.alt.trim() || cleanText(transport)?.split("•")[0].trim() || null,
+      logoUrl: logo?.currentSrc || logo?.src || null };
+  };
   function featureFor(card, info, index, transport, times) {
-    const from = parsePoint(info.dataset.departurePoint);
-    const to = parsePoint(info.dataset.arrivalPoint);
+    const from = parsePoint(info.dataset.departurePoint), to = parsePoint(info.dataset.arrivalPoint);
     if (!from || !to) return null;
-
     const durationSeconds = legDuration(info, card);
     const { departureTime, arrivalTime } = legTimes(info, times);
     const operator = operatorFor(info, card, transport);
-    const properties = {
-      journeyRank: rankValue(card.dataset.rank),
-      legIndex: index,
-      from: info.dataset.departureStationName || null,
-      to: info.dataset.arrivalStationName || null,
-      fromStationId: info.dataset.departureStation || null,
-      toStationId: info.dataset.arrivalStation || null,
-      transport: cleanText(transport),
-      departureTime,
-      arrivalTime,
-      operator: operator.name,
-      operatorLogoUrl: operator.logoUrl,
-      straightLineAverageSpeedKmh: durationSeconds
-        ? Number((distanceKm(from, to) / (durationSeconds / 3600)).toFixed(1))
-        : null,
-    };
-
     return {
-      type: "Feature",
-      properties,
-      geometry: { type: "LineString", coordinates: [from, to] },
+      type: "Feature", geometry: { type: "LineString", coordinates: [from, to] },
+      properties: {
+        journeyRank: rankValue(card.dataset.rank), legIndex: index,
+        from: info.dataset.departureStationName || null, to: info.dataset.arrivalStationName || null,
+        fromStationId: info.dataset.departureStation || null, toStationId: info.dataset.arrivalStation || null,
+        transport: cleanText(transport), departureTime, arrivalTime,
+        operator: operator.name, operatorLogoUrl: operator.logoUrl,
+        straightLineAverageSpeedKmh: durationSeconds
+          ? Number((distanceKm(from, to) / (durationSeconds / 3600)).toFixed(1)) : null,
+      },
     };
   }
 
   function currentFeatures(rank = null) {
     const features = [];
     for (const card of journeyCards) {
-      if (!card.isConnected) {
-        journeyCards.delete(card);
-        continue;
-      }
-      if ((rank !== null && rankValue(card.dataset.rank) !== rank)
-        || !card.getClientRects().length) continue;
+      if (!card.isConnected) { journeyCards.delete(card); continue; }
+      if ((rank !== null && rankValue(card.dataset.rank) !== rank) || !card.getClientRects().length) continue;
       const infos = card.querySelectorAll(LEG_INFO);
       if (!infos.length) continue;
-      const transports = card.querySelectorAll(TRANSPORT_NAME);
-      const times = clockTimes(card);
+      const transports = card.querySelectorAll(TRANSPORT_NAME), times = clockTimes(card);
       infos.forEach((info, index) => {
         const feature = featureFor(card, info, index, transports[index], times);
         if (feature) features.push(feature);
@@ -254,98 +180,69 @@
     }
     return features;
   }
+  const stationPairKey = ({ properties: p }) => JSON.stringify([
+    p.fromStationId || p.from, p.toStationId || p.to,
+  ].sort());
 
-  function stationPairKey(feature) {
-    const p = feature.properties;
-    return JSON.stringify([p.fromStationId || p.from, p.toStationId || p.to].sort());
-  }
-
+  // group routes by station pair,  aggregate count for line width, max speed for colour without hover
   function consolidateByStationPair(features) {
     const pairs = new Map();
     for (const feature of features) {
-      const p = feature.properties;
-      const key = stationPairKey(feature);
+      const p = feature.properties, key = stationPairKey(feature);
       let pair = pairs.get(key);
       if (!pair) {
-        pair = {
-          feature: {
-            type: "Feature",
-            geometry: feature.geometry,
-            properties: {
-              from: p.from,
-              to: p.to,
-              fromStationId: p.fromStationId,
-              toStationId: p.toStationId,
-              count: 0,
-              maxStraightLineAverageSpeedKmh: null,
-              routeKey: railRouteKey(feature),
-              routeEnds: routeEnds(feature),
-              operatorsByJourney: [],
-            },
-          },
-          journeyRanks: new Set(),
-        };
+        pair = { type: "Feature", geometry: feature.geometry, properties: {
+          from: p.from, to: p.to, fromStationId: p.fromStationId, toStationId: p.toStationId,
+          maxStraightLineAverageSpeedKmh: null, routeKey: railRouteKey(feature), routeEnds: routeEnds(feature),
+          journeyRanks: new Set(), operatorsByJourney: [],
+        } };
         pairs.set(key, pair);
       }
-
-      const properties = pair.feature.properties;
-      if (!pair.journeyRanks.has(p.journeyRank)) {
-        pair.journeyRanks.add(p.journeyRank);
+      const properties = pair.properties, ranks = properties.journeyRanks;
+      if (!ranks.has(p.journeyRank)) {
+        ranks.add(p.journeyRank);
         properties.operatorsByJourney.push({
-          journeyRank: p.journeyRank,
-          operator: p.operator,
-          operatorLogoUrl: p.operatorLogoUrl,
-          trainName: trainName(p.transport),
-          departureTime: p.departureTime,
-          arrivalTime: p.arrivalTime,
+          journeyRank: p.journeyRank, operator: p.operator, operatorLogoUrl: p.operatorLogoUrl,
+          trainName: trainName(p.transport), departureTime: p.departureTime, arrivalTime: p.arrivalTime,
         });
       }
       const speed = p.straightLineAverageSpeedKmh;
       if (speed !== null && (properties.maxStraightLineAverageSpeedKmh === null
-        || speed > properties.maxStraightLineAverageSpeedKmh)) {
-        properties.maxStraightLineAverageSpeedKmh = speed;
-      }
+        || speed > properties.maxStraightLineAverageSpeedKmh)) properties.maxStraightLineAverageSpeedKmh = speed;
     }
-    return [...pairs.values()].map(({ feature, journeyRanks }) => {
-      feature.properties.count = journeyRanks.size;
-      feature.properties.journeyRanks = [...journeyRanks];
-      return feature;
-    });
+    return pairs.values().map((pair) => {
+      const ranks = [...pair.properties.journeyRanks];
+      pair.properties.count = ranks.length;
+      pair.properties.journeyRanks = ranks;
+      return pair;
+    }).toArray();
   }
+  // }}}
 
+  // {{{ Operator colours
   function operatorFallbackColor(name) {
     let hash = 0;
-    for (const character of name || "unknown") {
-      hash = Math.imul(hash ^ character.charCodeAt(0), 16777619);
-    }
+    for (const character of name || "unknown") hash = Math.imul(hash ^ character.charCodeAt(0), 16777619);
     return `hsl(${(hash >>> 0) % 360}, 70%, 40%)`;
   }
 
+  // work out what to colour the routes by peeking at the operator logos
   function dominantLogoColor(image) {
     const canvas = document.createElement("canvas");
-    canvas.width = 32;
-    canvas.height = 32;
+    canvas.width = canvas.height = 32;
     const context = canvas.getContext("2d", { willReadFrequently: true });
     if (!context) return null;
     context.drawImage(image, 0, 0, 32, 32);
-    const pixels = context.getImageData(0, 0, 32, 32).data;
-    const colors = new Map();
-
+    const pixels = context.getImageData(0, 0, 32, 32).data, colors = new Map();
     for (let i = 0; i < pixels.length; i += 4) {
-      const red = pixels[i];
-      const green = pixels[i + 1];
-      const blue = pixels[i + 2];
+      const red = pixels[i], green = pixels[i + 1], blue = pixels[i + 2];
       if (pixels[i + 3] < 128 || (red > 235 && green > 235 && blue > 235)) continue;
       const key = `${red >> 4},${green >> 4},${blue >> 4}`;
       const color = colors.get(key) || { count: 0, red: 0, green: 0, blue: 0 };
-      color.count += 1;
-      color.red += red;
-      color.green += green;
-      color.blue += blue;
+      color.count++; color.red += red; color.green += green; color.blue += blue;
       colors.set(key, color);
     }
-
-    const dominant = [...colors.values()].sort((a, b) => b.count - a.count)[0];
+    const dominant = colors.values().reduce((best, color) => color.count > (best?.count ?? 0) ? color : best, null);
     if (!dominant) return null;
     return `rgb(${Math.round(dominant.red / dominant.count)},${Math.round(dominant.green / dominant.count)},${Math.round(dominant.blue / dominant.count)})`;
   }
@@ -354,21 +251,12 @@
     if (!url) return Promise.resolve(null);
     if (logoColorPromises.has(url)) return logoColorPromises.get(url);
     let source;
-    try {
-      source = new URL(url, location.href);
-    } catch {
-      return Promise.resolve(null);
-    }
-
+    try { source = new URL(url, location.href); } catch { return Promise.resolve(null); }
     const promise = new Promise((resolve) => {
       const image = document.createElement("img");
       if (source.origin !== location.origin) image.crossOrigin = "anonymous";
       const readColor = () => {
-        try {
-          resolve(dominantLogoColor(image));
-        } catch {
-          resolve(null);
-        }
+        try { resolve(dominantLogoColor(image)); } catch { resolve(null); }
       };
       image.onload = readColor;
       image.onerror = () => resolve(null);
@@ -383,53 +271,36 @@
   }
 
   function warmLogoColors(features) {
-    const urls = new Set();
-    for (const { properties } of features) {
-      if (properties.operatorLogoUrl) urls.add(properties.operatorLogoUrl);
-      properties.operatorsByJourney?.forEach(({ operatorLogoUrl }) => {
-        if (operatorLogoUrl) urls.add(operatorLogoUrl);
-      });
-    }
+    const urls = new Set(features.flatMap(({ properties: p }) => [
+      p.operatorLogoUrl, ...(p.operatorsByJourney?.map(({ operatorLogoUrl }) => operatorLogoUrl) || []),
+    ]).filter(Boolean));
     const layer = routeLayer;
-    Promise.all([...urls].map(loadLogoColor)).then(() => {
+    Promise.all(urls.values().map(loadLogoColor)).then(() => {
       if (routeLayer !== layer || !mapVisible) return;
       routeLayer.setStyle(featureStyle);
       if (hoveredJourneyRank !== null) setHoveredRoute(hoveredJourneyRank, true);
     });
   }
 
-  function routeEnds(feature) {
-    const p = feature.properties;
-    if (p.routeEnds) return p.routeEnds;
-    const coordinates = feature.geometry.coordinates;
-    return p.fromStationId && p.toStationId
-      ? [p.fromStationId, p.toStationId]
-      : [coordinates[0], coordinates.at(-1)];
-  }
+  // }}}
 
+  // {{{ Route cache
+  const routeEnds = ({ properties: p, geometry: { coordinates: coords } }) => p.routeEnds
+    || (p.fromStationId && p.toStationId ? [p.fromStationId, p.toStationId] : [coords[0], coords.at(-1)]);
   function routeIsReversed(feature) {
     const [from, to] = routeEnds(feature);
     return JSON.stringify(from) > JSON.stringify(to);
   }
-
   function railRouteKey(feature) {
     if (feature.properties.routeKey) return feature.properties.routeKey;
     const ends = [...routeEnds(feature)];
     if (routeIsReversed(feature)) ends.reverse();
     return ROUTE_CACHE_PREFIX + encodeURIComponent(JSON.stringify([ROUTE_PROFILE, ends]));
   }
-
-  function orientRoute(feature, coordinates) {
-    return routeIsReversed(feature) ? coordinates.slice().reverse() : coordinates;
-  }
-
-  function validRouteCoordinates(coordinates) {
-    return Array.isArray(coordinates) && coordinates.length >= 2
-      && coordinates.every((point) => Array.isArray(point) && point.length >= 2
-        && Number.isFinite(point[0]) && Number.isFinite(point[1])
-        && Math.abs(point[0]) <= 180 && Math.abs(point[1]) <= 90);
-  }
-
+  const orientRoute = (feature, coordinates) => routeIsReversed(feature) ? coordinates.toReversed() : coordinates;
+  const validRouteCoordinates = (coords) => Array.isArray(coords) && coords.length >= 2
+    && coords.every((p) => Array.isArray(p) && p.length >= 2 && Number.isFinite(p[0])
+      && Number.isFinite(p[1]) && Math.abs(p[0]) <= 180 && Math.abs(p[1]) <= 90);
   function displayRouteCoordinates(feature, coordinates) {
     const key = railRouteKey(feature) + (routeIsReversed(feature) ? ":reverse" : ":forward");
     if (displayRouteCache.has(key)) return displayRouteCache.get(key);
@@ -446,12 +317,8 @@
   function routeDatabase() {
     routeDatabasePromise ??= new Promise((resolve) => {
       let request;
-      try {
-        request = indexedDB.open("railfinder-hacks-openrailrouting", 1);
-      } catch {
-        resolve(null);
-        return;
-      }
+      try { request = indexedDB.open("railfinder-hacks-openrailrouting", 1); }
+      catch { resolve(null); return; }
       let blocked = false;
       request.onupgradeneeded = () => request.result.createObjectStore("routes");
       request.onerror = () => resolve(null);
@@ -474,11 +341,8 @@
         request.onsuccess = () => resolve(request.result);
         request.onerror = () => reject(request.error);
       });
-    } catch {
-      return null;
-    }
+    } catch { return null; }
   }
-
   async function storedRouteCoordinates(key, feature) {
     if (!routeGeometryCache.has(key)) {
       const db = await routeDatabase();
@@ -492,7 +356,6 @@
     }
     return orientRoute(feature, routeGeometryCache.get(key));
   }
-
   async function storeRouteCoordinates(key, coordinates) {
     routeGeometryCache.set(key, coordinates);
     const db = await routeDatabase();
@@ -509,10 +372,8 @@
         // Fall back to local storage if the database cannot accept writes.
       }
     }
-    try {
-      localStorage.setItem(key, JSON.stringify(coordinates));
-      return true;
-    } catch {
+    try { localStorage.setItem(key, JSON.stringify(coordinates)); return true; }
+    catch {
       if (!cacheWarningShown) {
         console.warn("Railfinder route map: Route storage is unavailable; routes may be fetched again.");
         cacheWarningShown = true;
@@ -520,7 +381,9 @@
       return false;
     }
   }
+  // }}}
 
+  // {{{ Route requests
   function retryAfterMilliseconds(response) {
     const value = response.headers.get("Retry-After");
     if (value) {
@@ -529,18 +392,13 @@
       const date = Date.parse(value);
       if (Number.isFinite(date)) return Math.max(0, date - Date.now());
     }
-
-    const reset = response.headers.get("RateLimit-Reset")
-      || response.headers.get("X-RateLimit-Reset");
+    const reset = response.headers.get("RateLimit-Reset") || response.headers.get("X-RateLimit-Reset");
     if (reset === null) return null;
-    const resetValue = Number(reset);
-    if (Number.isFinite(resetValue)) {
-      return Math.max(0, resetValue > 1e9 ? resetValue * 1000 - Date.now() : resetValue * 1000);
-    }
-    const resetDate = Date.parse(reset);
-    return Number.isFinite(resetDate) ? Math.max(0, resetDate - Date.now()) : null;
+    const number = Number(reset);
+    if (Number.isFinite(number)) return Math.max(0, number > 1e9 ? number * 1000 - Date.now() : number * 1000);
+    const date = Date.parse(reset);
+    return Number.isFinite(date) ? Math.max(0, date - Date.now()) : null;
   }
-
   function waitUntil(timestamp) {
     return new Promise((resolve) => {
       const poll = () => {
@@ -551,68 +409,48 @@
       poll();
     });
   }
-
   async function fetchRailRoute(feature) {
-    const [from, to] = feature.geometry.coordinates.length === 2
-      ? feature.geometry.coordinates
-      : [feature.geometry.coordinates[0], feature.geometry.coordinates.at(-1)];
+    const coords = feature.geometry.coordinates, from = coords[0], to = coords.at(-1);
     const url = new URL(OPEN_RAIL_ROUTING_URL);
     for (const [lon, lat] of [from, to]) url.searchParams.append("point", `${lat},${lon}`);
     url.searchParams.set("profile", ROUTE_PROFILE);
     url.searchParams.set("instructions", "false");
     url.searchParams.set("points_encoded", "false");
-
     for (let attempt = 0; attempt <= ROUTE_MAX_RETRIES; attempt += 1) {
       await waitUntil(nextRouteRequestAt);
-      const controller = new AbortController();
-      const timeout = window.setTimeout(() => controller.abort(), ROUTE_TIMEOUT_MS);
       let response;
       try {
-        response = await fetch(url, {
-          cache: "default",
-          headers: { Accept: "application/json" },
-          signal: controller.signal,
-        });
+        response = await fetch(url, { headers: { Accept: "application/json" }, signal: AbortSignal.timeout(ROUTE_TIMEOUT_MS) });
         if (/text\/html/i.test(response.headers.get("Content-Type") || "")) {
-          routeServiceBlockedReason = "challenge page returned";
-          return null;
+          routeServiceBlockedReason = "challenge page returned"; return null;
         }
         if ([401, 403, 404, 501].includes(response.status)) {
           routeServiceBlockedReason = response.status === 501
-            ? "requested profile unsupported"
-            : "authentication, endpoint, or access denied";
+            ? "requested profile unsupported" : "authentication, endpoint, or access denied";
           return null;
         }
         if (response.ok) {
-          const data = await response.json();
-          const points = data.paths?.[0]?.points;
+          const data = await response.json(), points = data.paths?.[0]?.points;
           const coordinates = points?.coordinates || points;
           if (!Array.isArray(coordinates)) {
             if (data.paths?.length) routeServiceBlockedReason = "unexpected geometry format";
             return null;
           }
-          if (!validRouteCoordinates(coordinates)) return null;
-          return coordinates.map(([lon, lat]) => [lon, lat]);
+          return validRouteCoordinates(coordinates) ? coordinates.map(([lon, lat]) => [lon, lat]) : null;
         }
       } catch (error) {
         if (error instanceof TypeError || error instanceof SyntaxError) {
           routeServiceBlockedReason = error instanceof TypeError
-            ? "CORS or network error"
-            : "invalid response (possibly a challenge)";
+            ? "CORS or network error" : "invalid response (possibly a challenge)";
           return null;
         }
         const delay = 1500 * 2 ** attempt + Math.random() * 500;
         nextRouteRequestAt = Math.max(nextRouteRequestAt, Date.now() + delay);
         if (attempt === ROUTE_MAX_RETRIES) return null;
         continue;
-      } finally {
-        window.clearTimeout(timeout);
       }
-
       const retryAfter = retryAfterMilliseconds(response);
-      if (retryAfter !== null) {
-        nextRouteRequestAt = Math.max(nextRouteRequestAt, Date.now() + retryAfter);
-      }
+      if (retryAfter !== null) nextRouteRequestAt = Math.max(nextRouteRequestAt, Date.now() + retryAfter);
       const retryable = response.status === 408 || response.status === 429 || response.status >= 500;
       if (!retryable || attempt === ROUTE_MAX_RETRIES) return null;
       const backoff = retryAfter ?? (response.status === 429 ? 30000 : 5000) * 2 ** attempt;
@@ -626,33 +464,26 @@
     if (!routeQueue.length || activeRouteRequests >= MAX_CONCURRENT_ROUTE_REQUESTS) return;
     const delay = nextRouteRequestAt - Date.now();
     if (delay > 0) {
-      if (!routeQueueTimer) {
-        routeQueueTimer = window.setTimeout(() => {
-          routeQueueTimer = null;
-          processRouteQueue();
-        }, delay);
-      }
+      if (!routeQueueTimer) routeQueueTimer = window.setTimeout(() => {
+        routeQueueTimer = null; processRouteQueue();
+      }, delay);
       return;
     }
-
     routeQueue.sort((a, b) => b.priority - a.priority);
     while (routeQueue.length && activeRouteRequests < MAX_CONCURRENT_ROUTE_REQUESTS) {
       const job = routeQueue.shift();
-      activeRouteRequests += 1;
+      activeRouteRequests++;
       fetchRailRoute(job.feature).then(async (coordinates) => {
         if (coordinates) {
           await storeRouteCoordinates(job.key, orientRoute(job.feature, coordinates));
           routeFailures.delete(job.key);
-          job.resolve(coordinates);
-        } else {
-          routeFailures.set(job.key, Date.now() + 10 * 60 * 1000);
-          job.resolve(null);
-        }
+        } else routeFailures.set(job.key, Date.now() + 10 * 60 * 1000);
+        job.resolve(coordinates);
       }).catch(() => {
         routeFailures.set(job.key, Date.now() + 10 * 60 * 1000);
         job.resolve(null);
       }).finally(() => {
-        activeRouteRequests -= 1;
+        activeRouteRequests--;
         if (routeServiceBlockedReason) cancelQueuedRoutes();
         processRouteQueue();
       });
@@ -663,25 +494,22 @@
     if (routeServiceBlockedReason) return;
     const key = railRouteKey(feature);
     if (pendingRouteRequests.has(key) || (routeFailures.get(key) || 0) > Date.now()) return;
-    const promise = new Promise((resolve) => {
-      const [from, to] = feature.geometry.coordinates;
-      routeQueue.push({ key, feature, resolve, priority: feature.properties.count * distanceKm(from, to) });
-    });
+    const { promise, resolve } = Promise.withResolvers();
+    const [from, to] = feature.geometry.coordinates;
+    routeQueue.push({ key, feature, resolve, priority: feature.properties.count * distanceKm(from, to) });
     pendingRouteRequests.set(key, promise);
     promise.then((coordinates) => {
       const layer = routeLayersByKey.get(key);
-      if (coordinates && layer && mapVisible) {
-        const directed = orientRoute(layer.line.feature, routeGeometryCache.get(key));
-        const display = displayRouteCoordinates(layer.line.feature, directed);
-        const latLngs = display.map(([lon, lat]) => [lat, lon]);
-        for (const route of [layer.line, layer.casing]) {
-          route.feature.geometry.coordinates = display;
-          route.setLatLngs(latLngs);
-        }
-        if (hoveredJourneyRank !== null
-          && layer.line.feature.properties.journeyRanks?.includes(hoveredJourneyRank)) {
-          renderHoveredTrainLabels();
-        }
+      if (!coordinates || !layer || !mapVisible) return;
+      const directed = orientRoute(layer.line.feature, routeGeometryCache.get(key));
+      const display = displayRouteCoordinates(layer.line.feature, directed);
+      const latLngs = display.map(([lon, lat]) => [lat, lon]);
+      for (const route of [layer.line, layer.casing]) {
+        route.feature.geometry.coordinates = display;
+        route.setLatLngs(latLngs);
+      }
+      if (hoveredJourneyRank !== null && layer.line.feature.properties.journeyRanks?.includes(hoveredJourneyRank)) {
+        renderHoveredTrainLabels();
       }
     }).finally(() => pendingRouteRequests.delete(key));
     return promise;
@@ -690,19 +518,13 @@
   function cancelQueuedRoutes() {
     if (routeQueueTimer) window.clearTimeout(routeQueueTimer);
     routeQueueTimer = null;
-    for (const job of routeQueue.splice(0)) {
-      job.resolve(null);
-    }
+    for (const job of routeQueue.splice(0)) job.resolve(null);
   }
+  // }}}
 
-  function lineWeight(feature, selected = false) {
-    return selected ? 3 : Math.min(12, 2 + feature.properties.count);
-  }
-
-  function isHoveredFeature(feature) {
-    return feature.properties.journeyRanks.includes(hoveredJourneyRank);
-  }
-
+  // {{{ Map styles
+  const lineWeight = (feature, selected = false) => selected ? 3 : Math.min(12, 2 + feature.properties.count);
+  const isHoveredFeature = (feature) => feature.properties.journeyRanks.includes(hoveredJourneyRank);
   function featureStyle(feature) {
     const p = feature.properties;
     const speed = p.maxStraightLineAverageSpeedKmh;
@@ -720,34 +542,27 @@
     const style = featureStyle(feature);
     return { ...style, color: "#fff", weight: style.weight + 2 };
   }
+  // }}}
 
-  function setLabelOffset(element, [x, y]) {
+  // {{{ Map labels
+  const setLabelOffset = (element, [x, y]) => {
     element.style.transform = `translate(-50%,-50%) translate(${x}px,${y}px)`;
-  }
-
+  };
   function layoutHoveredLabels() {
     if (!trainLabelLayer) return;
     const viewport = mapContainer.getBoundingClientRect();
-    const labels = hoveredLabelRecords.map((label) => ({
-      ...label,
-      rect: label.element.getBoundingClientRect(),
-    }));
-    const placed = [];
-    const moves = [];
+    const labels = hoveredLabelRecords.map((label) => ({ ...label, rect: label.element.getBoundingClientRect() }));
+    const placed = [], moves = [];
     for (const label of labels) {
       const { element, offsets, currentOffset, rect } = label;
       if (rect.right < viewport.left || rect.left > viewport.right
         || rect.bottom < viewport.top || rect.top > viewport.bottom) continue;
-      let bestOffset;
-      let bestRect;
+      let bestOffset, bestRect;
       const place = (offset) => {
-        const dx = offset[0] - currentOffset[0];
-        const dy = offset[1] - currentOffset[1];
+        const dx = offset[0] - currentOffset[0], dy = offset[1] - currentOffset[1];
         const candidate = {
-          left: rect.left + dx,
-          right: rect.right + dx,
-          top: rect.top + dy,
-          bottom: rect.bottom + dy,
+          left: rect.left + dx, right: rect.right + dx,
+          top: rect.top + dy, bottom: rect.bottom + dy,
         };
         if (candidate.right < viewport.left || candidate.left > viewport.right
           || candidate.bottom < viewport.top || candidate.top > viewport.bottom
@@ -760,7 +575,7 @@
       };
       if (![currentOffset, ...offsets, [0, 0]].some(place)) {
         const steps = Math.ceil(Math.max(viewport.width, viewport.height) / 28);
-        for (let step = 1; step <= steps; step += 1) {
+        for (let step = 1; step <= steps; step++) {
           if ([[0, -step], [0, step], [-step, 0], [step, 0],
             [-step, -step], [step, -step], [-step, step], [step, step]]
             .some(([x, y]) => place([x * 28, y * 28]))) break;
@@ -771,134 +586,85 @@
     }
     for (const { element, label, bestOffset } of moves) {
       element.style.visibility = bestOffset ? "" : "hidden";
-      if (bestOffset) {
-        setLabelOffset(element, bestOffset);
-        label.currentOffset = bestOffset;
-      }
+      if (bestOffset) { setLabelOffset(element, bestOffset); label.currentOffset = bestOffset; }
     }
   }
 
   function scheduleLabelLayout() {
     if (!trainLabelLayer || labelLayoutFrame) return;
-    labelLayoutFrame = requestAnimationFrame(() => {
-      labelLayoutFrame = 0;
-      layoutHoveredLabels();
-    });
+    labelLayoutFrame = requestAnimationFrame(() => { labelLayoutFrame = 0; layoutHoveredLabels(); });
   }
-
   function renderHoveredTrainLabels() {
     if (trainLabelLayer) routeMap.removeLayer(trainLabelLayer);
-    trainLabelLayer = null;
-    hoveredLabelRecords = [];
+    trainLabelLayer = null; hoveredLabelRecords = [];
     if (!routeMap || !routeLayer || hoveredJourneyRank === null) return;
-
-    const transport = document.querySelector(TRANSPORT_NAME);
-    const font = getComputedStyle(transport || pageRoot || document.body);
+    const font = getComputedStyle(document.querySelector(TRANSPORT_NAME) || pageRoot || document.body);
     const labels = L.layerGroup();
     const addLabel = (value, point, color, offsets, multiline = false) => {
       if (!value || !point) return;
       const text = document.createElement("span");
-      text.className = "railfinder-map-label";
-      text.textContent = value;
-      text.style.fontFamily = font.fontFamily;
-      text.style.fontSize = font.fontSize;
-      text.style.fontWeight = font.fontWeight;
-      text.style.color = color;
-      text.style.textAlign = "center";
-      text.style.whiteSpace = multiline ? "pre" : "nowrap";
+      text.className = "railfinder-map-label"; text.textContent = value;
+      text.style.fontFamily = font.fontFamily; text.style.fontSize = font.fontSize;
+      text.style.fontWeight = font.fontWeight; text.style.color = color;
+      text.style.textAlign = "center"; text.style.whiteSpace = multiline ? "pre" : "nowrap";
       setLabelOffset(text, offsets[0]);
-      const icon = L.divIcon({
-        className: "railfinder-train-label-icon",
-        html: text,
-        iconSize: [1, 1],
-        iconAnchor: [0, 0],
-      });
+      const icon = L.divIcon({ className: "railfinder-train-label-icon", html: text,
+        iconSize: [1, 1], iconAnchor: [0, 0] });
       labels.addLayer(L.marker(point, { icon, interactive: false, keyboard: false }));
       hoveredLabelRecords.push({ element: text, offsets, currentOffset: offsets[0] });
     };
     const addStationLabel = (name, point, times) => {
       if (!name) return;
       const timeText = times.filter(Boolean).join(" ");
-      addLabel(`${name}${timeText ? `\n${timeText}` : ""}`, point, "#172554", [
-        [0, -24], [0, -44], [24, -24], [-24, -24], [24, 24], [-24, 24], [0, 44],
-      ], Boolean(timeText));
+      addLabel(`${name}${timeText ? `\n${timeText}` : ""}`, point, "#172554",
+        [[0, -24], [0, -44], [24, -24], [-24, -24], [24, 24], [-24, 24], [0, 44]], Boolean(timeText));
     };
-
     routeLayer.eachLayer((layer) => {
       const feature = layer.feature;
       if (!isHoveredFeature(feature)) return;
-      const journey = feature.properties.operatorsByJourney?.find(
-        (entry) => entry.journeyRank === hoveredJourneyRank,
-      );
+      const journey = feature.properties.operatorsByJourney?.find((entry) => entry.journeyRank === hoveredJourneyRank);
       if (!journey?.trainName) return;
-      const points = layer.getLatLngs();
-      const middle = Math.floor(points.length / 2);
+      const points = layer.getLatLngs(), middle = Math.floor(points.length / 2);
       const point = points[middle];
       if (!point) return;
       const before = routeMap.latLngToLayerPoint(points[Math.max(0, middle - 1)]);
       const after = routeMap.latLngToLayerPoint(points[Math.min(points.length - 1, middle + 1)]);
-      const dx = after.x - before.x;
-      const dy = after.y - before.y;
-      const length = Math.hypot(dx, dy) || 1;
-      const side = hoveredJourneyRank % 2 ? 1 : -1;
-      const normalX = -dy / length * side;
-      const normalY = dx / length * side;
-      const tangentX = dx / length;
-      const tangentY = dy / length;
-      const offsets = [16, 32, 48].map((distance) => [
-        normalX * distance,
-        normalY * distance,
+      const dx = after.x - before.x, dy = after.y - before.y;
+      const length = Math.hypot(dx, dy) || 1, side = hoveredJourneyRank % 2 ? 1 : -1;
+      const nx = -dy / length * side, ny = dx / length * side;
+      const offsets = [16, 32, 48].map((distance) => [nx * distance, ny * distance]);
+      for (const shift of [-48, -24, 24, 48]) offsets.push([
+        nx * 16 + dx / length * shift, ny * 16 + dy / length * shift,
       ]);
-      for (const shift of [-48, -24, 24, 48]) {
-        offsets.push([normalX * 16 + tangentX * shift, normalY * 16 + tangentY * shift]);
-      }
       addLabel(journey.trainName, point, featureStyle(feature).color, offsets);
     });
 
-    const legs = currentFeatures(hoveredJourneyRank)
-      .sort((a, b) => a.properties.legIndex - b.properties.legIndex);
+    const legs = currentFeatures(hoveredJourneyRank).sort((a, b) => a.properties.legIndex - b.properties.legIndex);
     if (legs.length) {
-      const first = legs[0];
-      const [startLongitude, startLatitude] = first.geometry.coordinates[0];
-      addStationLabel(first.properties.from, L.latLng(startLatitude, startLongitude), [
-        first.properties.departureTime && `dep: ${first.properties.departureTime}`,
-      ]);
-      const last = legs.at(-1);
-      const [endLongitude, endLatitude] = last.geometry.coordinates.at(-1);
-      addStationLabel(last.properties.to, L.latLng(endLatitude, endLongitude), [
-        last.properties.arrivalTime && `arr: ${last.properties.arrivalTime}`,
-      ]);
+      [[legs[0], 0, "from", "departureTime", "dep"],
+        [legs.at(-1), -1, "to", "arrivalTime", "arr"]].forEach(([leg, end, name, time, label]) => {
+        const [lon, lat] = leg.geometry.coordinates.at(end);
+        addStationLabel(leg.properties[name], L.latLng(lat, lon), [
+          leg.properties[time] && `${label}: ${leg.properties[time]}`]);
+      });
     }
     for (let index = 0; index < legs.length - 1; index += 1) {
-      const leg = legs[index];
-      const next = legs[index + 1];
+      const leg = legs[index], next = legs[index + 1];
       const sameStation = (leg.properties.toStationId && next.properties.fromStationId
-        && leg.properties.toStationId === next.properties.fromStationId)
-        || leg.properties.to === next.properties.from;
-      const stationName = sameStation
-        ? leg.properties.to
-        : [leg.properties.to, next.properties.from].filter(Boolean).join(" → ");
+        && leg.properties.toStationId === next.properties.fromStationId) || leg.properties.to === next.properties.from;
+      const stationName = sameStation ? leg.properties.to : [leg.properties.to, next.properties.from].filter(Boolean).join(" → ");
       if (!stationName) continue;
-      const [longitude, latitude] = leg.geometry.coordinates.at(-1);
-      addStationLabel(stationName, L.latLng(latitude, longitude), [
+      const [lon, lat] = leg.geometry.coordinates.at(-1);
+      addStationLabel(stationName, L.latLng(lat, lon), [
         leg.properties.arrivalTime && `arr: ${leg.properties.arrivalTime}`,
-        next.properties.departureTime && `dep: ${next.properties.departureTime}`,
-      ]);
+        next.properties.departureTime && `dep: ${next.properties.departureTime}`]);
     }
-    if (labels.getLayers().length) {
-      trainLabelLayer = labels.addTo(routeMap);
-      layoutHoveredLabels();
-    }
+    if (labels.getLayers().length) { trainLabelLayer = labels.addTo(routeMap); layoutHoveredLabels(); }
   }
+  // }}}
 
-  function cardForRank(rank) {
-    for (const card of journeyCards) {
-      if (card.isConnected && rankValue(card.dataset.rank) === rank
-        && card.getClientRects().length) return card;
-    }
-    return null;
-  }
-
+  // {{{ Route selection and map drawing
+  const cardForRank = (r) => journeyCards.values().find((c) => c.isConnected && rankValue(c.dataset.rank) === r && c.getClientRects().length) || null;
   function setHoveredRoute(rank, force = false) {
     const nextRank = rank === null ? null : rankValue(rank);
     if (!force && hoveredJourneyRank === nextRank) return;
@@ -906,15 +672,10 @@
     selectedCard?.removeAttribute("data-railfinder-selected");
     selectedCard = cardForRank(nextRank);
     selectedCard?.setAttribute("data-railfinder-selected", "");
-    if (!routeLayer) {
-      renderHoveredTrainLabels();
-      return;
-    }
+    if (!routeLayer) return renderHoveredTrainLabels();
     routeLayer.setStyle(featureStyle);
     casingLayer?.setStyle(casingStyle);
-    routeLayer.eachLayer((layer) => {
-      if (isHoveredFeature(layer.feature)) layer.bringToFront();
-    });
+    routeLayer.eachLayer((layer) => { if (isHoveredFeature(layer.feature)) layer.bringToFront(); });
     renderHoveredTrainLabels();
   }
 
@@ -940,24 +701,17 @@
     renderHoveredTrainLabels();
     routeLayersByKey = new Map();
     features.forEach((feature, index) => {
-      if (cached[index]) {
-        feature.geometry.coordinates = displayRouteCoordinates(feature, cached[index]);
-      }
+      if (cached[index]) feature.geometry.coordinates = displayRouteCoordinates(feature, cached[index]);
     });
     if (!features.length) return;
 
     const collection = { type: "FeatureCollection", features };
     casingLayer = L.geoJSON(collection, {
-      style: casingStyle,
-      smoothFactor: 3,
-      interactive: false,
-      onEachFeature: (feature, layer) => {
-        routeLayersByKey.set(railRouteKey(feature), { casing: layer });
-      },
+      style: casingStyle, smoothFactor: 3, interactive: false,
+      onEachFeature: (feature, layer) => routeLayersByKey.set(railRouteKey(feature), { casing: layer }),
     }).addTo(routeMap);
     routeLayer = L.geoJSON(collection, {
-      style: featureStyle,
-      smoothFactor: 3,
+      style: featureStyle, smoothFactor: 3,
       onEachFeature: (feature, layer) => {
         const key = railRouteKey(feature);
         layer.on("mouseover", () => {
@@ -986,22 +740,18 @@
     if (hoveredJourneyRank !== null) setHoveredRoute(hoveredJourneyRank, true);
     features.forEach((feature, index) => { if (!cached[index]) requestRailRoute(feature); });
     processRouteQueue();
-
     const bounds = routeLayer.getBounds();
     if (bounds.isValid() && (forceFit || !mapHasFittedData)) {
       routeMap.fitBounds(bounds.pad(0.1), { maxZoom: 9 });
       mapHasFittedData = true;
     }
   }
+  // }}}
 
+  // {{{ Map pane and Turbo lifecycle
   function resizeMapPane() {
-    if (!mapVisible) return;
-    if (routeMap) requestAnimationFrame(() => {
-      routeMap.invalidateSize();
-      scheduleLabelLayout();
-    });
+    if (mapVisible && routeMap) requestAnimationFrame(() => { routeMap.invalidateSize(); scheduleLabelLayout(); });
   }
-
   function mountMapPane() {
     const root = document.querySelector('[data-controller~="filter"]');
     const results = root?.querySelector('#results, [data-filter-target~="elementContainer"]');
@@ -1017,10 +767,7 @@
     return true;
   }
 
-  function leaveResults() {
-    setHoveredRoute(null);
-  }
-
+  const leaveResults = () => setHoveredRoute(null);
   function closeMapPane() {
     window.clearTimeout(mapLeaveTimer);
     setHoveredRoute(null);
@@ -1031,8 +778,7 @@
     cancelQueuedRoutes();
     if (!mapReopenButton) {
       mapReopenButton = document.createElement("button");
-      mapReopenButton.id = "railfinder-reopen-button";
-      mapReopenButton.type = "button";
+      mapReopenButton.id = "railfinder-reopen-button"; mapReopenButton.type = "button";
       mapReopenButton.textContent = "Open route map";
       mapReopenButton.className = "railfinder-map-button railfinder-reopen-button";
       mapReopenButton.addEventListener("click", openMap);
@@ -1043,22 +789,15 @@
 
   function createMapPane() {
     mapPane = document.createElement("section");
-    mapPane.id = "railfinder-route-pane";
-    mapPane.className = "railfinder-route-pane";
-    mapPane.style.display = "none";
-    mapPane.style.flexDirection = "column";
+    mapPane.id = "railfinder-route-pane"; mapPane.className = "railfinder-route-pane";
+    mapPane.style.display = "none"; mapPane.style.flexDirection = "column";
     mapPane.setAttribute("aria-label", "Rail route map");
-
-    const toolbar = document.createElement("div");
+    const toolbar = document.createElement("div"), title = document.createElement("strong");
     toolbar.style.cssText = "display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:8px;font:14px 'Apercu Pro',sans-serif";
-    const title = document.createElement("strong");
     title.textContent = "bovine3dom's unofficial route map";
     const close = document.createElement("button");
-    close.type = "button";
-    close.textContent = "Hide map";
-    close.className = "railfinder-map-button";
+    close.type = "button"; close.textContent = "Hide map"; close.className = "railfinder-map-button";
     toolbar.append(title, close);
-
     mapContainer = document.createElement("div");
     mapContainer.style.cssText = "flex:1;min-height:0;width:100%;border-radius:12px";
     mapPane.append(toolbar, mapContainer);
@@ -1076,9 +815,7 @@
     window.addEventListener("resize", resizeMapPane);
     resizeMapPane();
     requestAnimationFrame(() => {
-      if (typeof L === "undefined") {
-        return;
-      }
+      if (typeof L === "undefined") return;
       if (!routeMap) {
         routeMap = L.map(mapContainer);
         routeMap.on("zoomend", () => window.setTimeout(layoutHoveredLabels, 0));
@@ -1088,9 +825,7 @@
           maxZoom: 19,
           attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap contributors</a>',
         }).addTo(routeMap);
-        routeMap.attributionControl.addAttribution(
-          '© <a href="https://routing.openrailrouting.org/">OpenRailRouting</a>',
-        );
+        routeMap.attributionControl.addAttribution('© <a href="https://routing.openrailrouting.org/">OpenRailRouting</a>');
         routeMap.setView([51, 7], 5);
       }
       routeMap.invalidateSize();
@@ -1105,15 +840,14 @@
     const results = root?.querySelector('#results, [data-filter-target~="elementContainer"]');
     if (!results) return;
     if (!mapVisible) {
-      if (root.classList.contains("railfinder-split-page")) root.classList.remove("railfinder-split-page");
+      root.classList.remove("railfinder-split-page");
       if (mapReopenButton && !mapReopenButton.isConnected) document.body.append(mapReopenButton);
       return;
     }
     if (root === pageRoot && results === resultsRoot && mapPane.isConnected) return;
     mountMapPane();
     pageRoot.classList.add("railfinder-split-page");
-    pageRoot.querySelectorAll("[data-railfinder-selected]")
-      .forEach((card) => card.removeAttribute("data-railfinder-selected"));
+    pageRoot.querySelectorAll("[data-railfinder-selected]").forEach((card) => card.removeAttribute("data-railfinder-selected"));
     setHoveredRoute(null);
     mapHasFittedData = false;
     requestAnimationFrame(() => {
@@ -1123,63 +857,43 @@
     });
   }
 
+  // re-attach ourselves after server-side rendering updates the page
   document.addEventListener("turbo:before-render", (event) => {
     const newBody = event.detail?.newBody;
     if (!newBody?.querySelector('[data-controller~="filter"]')) return;
-    newBody.querySelectorAll("[data-railfinder-selected]")
-      .forEach((card) => card.removeAttribute("data-railfinder-selected"));
+    newBody.querySelectorAll("[data-railfinder-selected]").forEach((card) => card.removeAttribute("data-railfinder-selected"));
     for (const element of [mapPane, mapReopenButton]) {
       const copy = element && newBody.querySelector(`#${element.id}`);
       if (copy && copy !== element) copy.remove();
     }
   });
-  document.addEventListener("turbo:render", () => {
-    rememberCards(document.body);
-    syncSearchPage();
-  });
+  document.addEventListener("turbo:render", () => { rememberCards(document.body); syncSearchPage(); });
   document.addEventListener("turbo:frame-render", (event) => {
-    if (event.target.id === "results") {
-      setHoveredRoute(null);
-      scheduleMapUpdate();
-    }
+    if (event.target.id === "results") { setHoveredRoute(null); scheduleMapUpdate(); }
   });
-
   function scheduleMapUpdate() {
     if (!mapVisible) return;
     window.clearTimeout(mapUpdateTimer);
-    mapUpdateTimer = window.setTimeout(() => {
-      mapUpdateTimer = null;
-      if (mapVisible) renderMap();
-    }, 400);
+    mapUpdateTimer = window.setTimeout(() => { mapUpdateTimer = null; if (mapVisible) renderMap(); }, 400);
   }
-
   rememberCards(document.documentElement);
 
+  // update the map as the results load
   const observer = new MutationObserver((records) => {
     let routesChanged = false;
     for (const record of records) {
       if (mapPane?.contains(record.target)) continue;
       if (record.type === "attributes") {
-        const card = record.target.matches("[data-rank]")
-          ? record.target
-          : record.target.closest("[data-rank]");
-        if (card) {
-          rememberCards(card);
-          routesChanged = true;
-        }
+        const card = record.target.matches("[data-rank]") ? record.target : record.target.closest("[data-rank]");
+        if (card) { rememberCards(card); routesChanged = true; }
         continue;
       }
 
-      const target = record.target.nodeType === Node.ELEMENT_NODE
-        ? record.target
-        : record.target.parentElement;
+      const target = record.target.nodeType === Node.ELEMENT_NODE ? record.target : record.target.parentElement;
       const targetCard = target?.closest("[data-rank]");
       if (targetCard && journeyCards.has(targetCard)) routesChanged = true;
       for (const node of record.addedNodes) {
-        if (node instanceof Element
-          && (node.matches("[data-rank]") || node.querySelector("[data-rank]"))) {
-          routesChanged = true;
-        }
+        if (node instanceof Element && (node.matches("[data-rank]") || node.querySelector("[data-rank]"))) routesChanged = true;
         rememberCards(node);
       }
     }
@@ -1190,25 +904,14 @@
 
   let mapUpdateTimer;
   observer.observe(document.documentElement, {
-    childList: true,
-    characterData: true,
-    subtree: true,
-    attributes: true,
+    childList: true, characterData: true, subtree: true, attributes: true,
     attributeFilter: [
-      "data-rank",
-      "data-departure-station",
-      "data-departure-station-name",
-      "data-departure-point",
-      "data-arrival-station",
-      "data-arrival-station-name",
-      "data-arrival-point",
-      "src",
-      "srcset",
-      "alt",
-      "class",
-      "hidden",
-      "style",
+      "data-rank", "data-departure-station", "data-departure-station-name", "data-departure-point",
+      "data-arrival-station", "data-arrival-station-name", "data-arrival-point",
+      "src", "srcset", "alt", "class", "hidden", "style",
     ],
   });
   openMap();
+  // }}}
 })();
+// vim: set foldmethod=marker foldlevel=0 :
