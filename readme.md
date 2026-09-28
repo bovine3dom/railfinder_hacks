@@ -4,7 +4,7 @@ userscripts for railfinder.eu. currently just making maps of routes
 
 # installation
 
-for browsers that support userscripts, if you have e.g. Tampermonkey installed, you can install the script directly by clicking this link: [content.user.js](https://raw.githubusercontent.com/bovine3dom/railfinder_hacks/master/src/content.user.js)
+for browsers that support userscripts, if you have e.g. Tampermonkey installed, you can install the script directly by clicking this link: [routemap.user.js](https://raw.githubusercontent.com/bovine3dom/railfinder_hacks/master/src/routemap.user.js)
 
 # todo
 

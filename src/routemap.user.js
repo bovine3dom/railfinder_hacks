@@ -8,8 +8,8 @@
 // @run-at       document-idle
 // @require      https://cdn.jsdelivr.net/npm/leaflet@1.9.4/dist/leaflet.js
 // @resource     LEAFLET_CSS https://cdn.jsdelivr.net/npm/leaflet@1.9.4/dist/leaflet.css
-// @updateURL    https://raw.githubusercontent.com/bovine3dom/railfinder_hacks/master/src/content.user.js
-// @downloadURL  https://raw.githubusercontent.com/bovine3dom/railfinder_hacks/master/src/content.user.js
+// @updateURL    https://raw.githubusercontent.com/bovine3dom/railfinder_hacks/master/src/routemap.user.js
+// @downloadURL  https://raw.githubusercontent.com/bovine3dom/railfinder_hacks/master/src/routemap.user.js
 // @supportURL   https://github.com/bovine3dom/railfinder_hacks/issues/
 // @grant        GM_addStyle
 // @grant        GM_getResourceText
