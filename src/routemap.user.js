@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Railfinder route map
 // @namespace    railfinder-hacks
-// @version      0.18.4
+// @version      0.18.5
 // @author       bovine3dom
 // @description  map for railfinder.eu search results
 // @match        https://www.railfinder.eu/*
@@ -45,10 +45,10 @@
     .railfinder-map-label{display:inline-block;white-space:nowrap;line-height:1;-webkit-text-stroke:3px white;paint-order:stroke fill;text-shadow:0 0 2px white;pointer-events:none}
     [data-railfinder-selected] > :first-child{outline:2px solid #d14d00;outline-offset:2px}
     .railfinder-split-page{position:relative;width:50vw;min-width:0}
-    .railfinder-route-pane{position:fixed;inset:0 0 0 50vw;width:50vw;height:100vh;z-index:2147483646;box-sizing:border-box;padding:12px;background:#fff5f0;color:#122533;border-left:1px solid #ffd5bd;box-shadow:0 2px 10px #231f2026}
+    .railfinder-route-pane{position:fixed;inset:0 0 0 50vw;width:50vw;height:100vh;z-index:20;box-sizing:border-box;padding:12px;background:#fff5f0;color:#122533;border-left:1px solid #ffd5bd;box-shadow:0 2px 10px #231f2026}
     .railfinder-map-button{padding:6px 12px;border:1px solid #ff985c;border-radius:12px;background:white;color:#d14d00;cursor:pointer}
     .railfinder-map-button:hover,.railfinder-map-button:focus-visible{background:#ffece0}
-    .railfinder-reopen-button{position:fixed;right:16px;bottom:16px;z-index:2147483647;box-shadow:0 2px 8px #231f2026}
+    .railfinder-reopen-button{position:fixed;right:16px;bottom:16px;z-index:20;box-shadow:0 2px 8px #231f2026}
     @media(min-width:1100px){
       .railfinder-split-page nav > div > div > [class~="sm:flex"]{display:none}
       .railfinder-split-page nav > div > div > [class~="sm:hidden"]{display:flex}
