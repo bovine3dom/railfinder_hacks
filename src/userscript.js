@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Railfinder route map
 // @namespace    railfinder-hacks
-// @version      0.9.0
+// @version      0.10.0
 // @description  Map Railfinder journey routes.
 // @match        https://www.railfinder.eu/search*
 // @run-at       document-idle
@@ -16,11 +16,9 @@
 
   const LEG_INFO = ".travel-leg-info";
   const TRANSPORT_NAME = ".travel-leg-transport-name";
-  const MAX_CURVE_FRACTION = 0.12;
   const OPEN_RAIL_ROUTING_URL = "https://routing.openrailrouting.org/route";
   const ROUTE_PROFILE = "all_tracks";
   const ROUTE_CACHE_PREFIX = "railfinder.openrailrouting.v1:";
-  const ROUTE_REQUEST_GAP_MS = 0;
   const ROUTE_MAX_RETRIES = 2;
   const ROUTE_TIMEOUT_MS = 20000;
   const ROUTE_DEFAULT_CACHE_MS = 7 * 24 * 60 * 60 * 1000;
@@ -43,7 +41,6 @@
   let originalBodyOverflow;
   let mapPane;
   let mapContainer;
-  let mapMode;
   let mapStatus;
   let routeMap;
   let casingLayer;
@@ -153,7 +150,6 @@
     const operator = operatorFor(info, card, transport);
     const properties = {
       journeyRank: rankValue(card.dataset.rank),
-      leg: index + 1,
       from: info.dataset.departureStationName || null,
       to: info.dataset.arrivalStationName || null,
       fromStationId: info.dataset.departureStation || null,
@@ -162,7 +158,6 @@
       operator: operator.name,
       operatorLogoUrl: operator.logoUrl,
       durationSeconds,
-      straightLineDistanceKm: Number(straightLineDistanceKm.toFixed(2)),
       straightLineAverageSpeedKmh: durationSeconds
         ? Number((straightLineDistanceKm / (durationSeconds / 3600)).toFixed(1))
         : null,
@@ -211,11 +206,8 @@
               fromStationId: p.fromStationId,
               toStationId: p.toStationId,
               count: 0,
-              legOccurrences: 0,
               maxStraightLineAverageSpeedKmh: null,
               maxSpeedDurationSeconds: null,
-              maxSpeedJourneyRank: null,
-              maxSpeedLeg: null,
               maxSpeedTransport: null,
               operator: null,
               operatorLogoUrl: null,
@@ -228,7 +220,6 @@
       }
 
       const properties = pair.feature.properties;
-      properties.legOccurrences += 1;
       if (!pair.journeyRanks.has(p.journeyRank)) {
         pair.journeyRanks.add(p.journeyRank);
         properties.operatorsByJourney.push({
@@ -242,8 +233,6 @@
         || speed > properties.maxStraightLineAverageSpeedKmh)) {
         properties.maxStraightLineAverageSpeedKmh = speed;
         properties.maxSpeedDurationSeconds = p.durationSeconds;
-        properties.maxSpeedJourneyRank = p.journeyRank;
-        properties.maxSpeedLeg = p.leg;
         properties.maxSpeedTransport = p.transport;
         properties.operator = p.operator;
         properties.operatorLogoUrl = p.operatorLogoUrl;
@@ -252,7 +241,6 @@
     return [...pairs.values()].map(({ feature, journeyRanks }) => {
       feature.properties.count = journeyRanks.size;
       feature.properties.journeyRanks = [...journeyRanks];
-      feature.properties.logCount = Math.log10(feature.properties.count) + 1;
       return feature;
     });
   }
@@ -452,7 +440,6 @@
 
     for (let attempt = 0; attempt <= ROUTE_MAX_RETRIES; attempt += 1) {
       await waitUntil(nextRouteRequestAt);
-      nextRouteRequestAt = Date.now() + ROUTE_REQUEST_GAP_MS;
       const controller = new AbortController();
       const timeout = window.setTimeout(() => controller.abort(), ROUTE_TIMEOUT_MS);
       let response;
@@ -511,7 +498,7 @@
   }
 
   function updateRoutingStatus() {
-    if (!mapStatus || !currentPairFeatures?.length || mapMode.value !== "pairs") return;
+    if (!mapStatus || !currentPairFeatures?.length) return;
     if (routeServiceBlockedReason) {
       mapStatus.textContent = `OpenRailRouting unavailable (${routeServiceBlockedReason}); unresolved pairs use straight lines.`;
       return;
@@ -529,6 +516,7 @@
 
   function processRouteQueue() {
     if (routeQueueActive || !routeQueue.length) return;
+    routeQueue.sort((a, b) => b.priority - a.priority);
     routeQueueActive = true;
     const job = routeQueue.shift();
     fetchRailRoute(job.feature).then((result) => {
@@ -562,11 +550,14 @@
     if (pendingRouteRequests.has(key)) return pendingRouteRequests.get(key);
     if ((routeFailures.get(key) || 0) > Date.now()) return Promise.resolve(null);
 
-    const promise = new Promise((resolve) => routeQueue.push({ key, feature, resolve }));
+    const promise = new Promise((resolve) => {
+      const [from, to] = feature.geometry.coordinates;
+      routeQueue.push({ key, feature, resolve, priority: feature.properties.count * distanceKm(from, to) });
+    });
     pendingRouteRequests.set(key, promise);
     promise.then((coordinates) => {
       const layer = routeLayersByKey.get(key);
-      if (coordinates && layer && mapVisible && mapMode.value === "pairs") {
+      if (coordinates && layer && mapVisible) {
         for (const route of [layer.line, layer.casing]) {
           route.feature.geometry.coordinates = coordinates;
           route.setLatLngs(coordinates.map(([lon, lat]) => [lat, lon]));
@@ -574,7 +565,6 @@
       }
       updateRoutingStatus();
     });
-    processRouteQueue();
     return promise;
   }
 
@@ -592,12 +582,11 @@
       ["From", p.from],
       ["To", p.to],
       ["Count", p.count],
-      ["Leg duration", formatDuration(p.maxSpeedDurationSeconds ?? p.durationSeconds)],
-      ["Max straight-line speed", p.maxStraightLineAverageSpeedKmh ?? p.straightLineAverageSpeedKmh],
+      ["Leg duration", formatDuration(p.maxSpeedDurationSeconds)],
+      ["Max straight-line speed", p.maxStraightLineAverageSpeedKmh],
       ["Operator", p.operator],
       ["Transport", p.maxSpeedTransport ?? p.transport],
     ];
-    if (p.journeyRank !== undefined) rows.push(["Journey", p.journeyRank], ["Leg", p.leg]);
     for (const [label, value] of rows) {
       if (value === undefined || value === null) continue;
       const row = document.createElement("div");
@@ -607,91 +596,24 @@
     return content;
   }
 
-  function curvedLeg(feature, offsetFraction) {
-    const [[fromLon, fromLat], [toLon, toLat]] = feature.geometry.coordinates;
-    const radius = 6378137;
-    const toRadians = Math.PI / 180;
-    const project = ([lon, lat]) => [
-      radius * lon * toRadians,
-      radius * Math.log(Math.tan(Math.PI / 4 + lat * toRadians / 2)),
-    ];
-    const unproject = ([x, y]) => [
-      x / radius / toRadians,
-      (2 * Math.atan(Math.exp(y / radius)) - Math.PI / 2) / toRadians,
-    ];
-    const start = project([fromLon, fromLat]);
-    const end = project([toLon, toLat]);
-    const dx = end[0] - start[0];
-    const dy = end[1] - start[1];
-    const length = Math.hypot(dx, dy);
-    if (!length) return feature;
-
-    const offset = length * offsetFraction;
-    const control = [
-      (start[0] + end[0]) / 2 - dy / length * offset,
-      (start[1] + end[1]) / 2 + dx / length * offset,
-    ];
-    const coordinates = Array.from({ length: 17 }, (_, index) => {
-      const t = index / 16;
-      const inverse = 1 - t;
-      return unproject([
-        inverse ** 2 * start[0] + 2 * inverse * t * control[0] + t ** 2 * end[0],
-        inverse ** 2 * start[1] + 2 * inverse * t * control[1] + t ** 2 * end[1],
-      ]);
-    });
-    return { ...feature, geometry: { ...feature.geometry, coordinates } };
-  }
-
-  function curveLegs(features) {
-    const groups = new Map();
-    for (const feature of features) {
-      const key = stationPairKey(feature);
-      if (!groups.has(key)) groups.set(key, []);
-      groups.get(key).push(feature);
-    }
-
-    const curved = [];
-    for (const group of groups.values()) {
-      group.sort((a, b) => {
-        const speedA = a.properties.straightLineAverageSpeedKmh ?? -Infinity;
-        const speedB = b.properties.straightLineAverageSpeedKmh ?? -Infinity;
-        return speedB - speedA
-          || Number(a.properties.journeyRank) - Number(b.properties.journeyRank)
-          || a.properties.leg - b.properties.leg;
-      });
-      group.forEach((feature, index) => {
-        if (group.length === 1) curved.push(feature);
-        else {
-          const rank = index + 1;
-          const side = rank % 2 ? 1 : -1;
-          curved.push(curvedLeg(feature, side * MAX_CURVE_FRACTION * rank / group.length));
-        }
-      });
-    }
-    return curved;
-  }
-
   function lineWeight(feature, selected = false) {
     const count = feature.properties.count;
     return selected || count === undefined ? 3 : Math.min(12, 2 + count);
   }
 
   function isHoveredFeature(feature) {
-    const p = feature.properties;
-    return p.journeyRank === hoveredJourneyRank || p.journeyRanks?.includes(hoveredJourneyRank);
+    return feature.properties.journeyRanks?.includes(hoveredJourneyRank);
   }
 
   function featureStyle(feature) {
     const p = feature.properties;
-    const speed = p.maxStraightLineAverageSpeedKmh ?? p.straightLineAverageSpeedKmh;
+    const speed = p.maxStraightLineAverageSpeedKmh;
     const speedColor = speed >= 100 ? "#dc2626" : speed >= 60 ? "#ea580c" : "#2563eb";
     const selected = isHoveredFeature(feature);
     if (hoveredJourneyRank === null) return { color: speedColor, weight: lineWeight(feature), opacity: 0.8 };
     if (!selected) return { color: speedColor, weight: lineWeight(feature), opacity: 0.12 };
 
-    const operator = p.journeyRank === hoveredJourneyRank
-      ? p
-      : p.operatorsByJourney?.find((entry) => entry.journeyRank === hoveredJourneyRank) || p;
+    const operator = p.operatorsByJourney?.find((entry) => entry.journeyRank === hoveredJourneyRank) || p;
     const color = logoColors.get(operator.operatorLogoUrl) || operatorFallbackColor(operator.operator);
     return { color, weight: lineWeight(feature, true), opacity: 1 };
   }
@@ -718,21 +640,14 @@
     casingLayer = routeLayer = null;
     routeLayersByKey = new Map();
 
-    const legs = currentFeatures();
-    const pairsMode = mapMode.value === "pairs";
-    if (!pairsMode) cancelQueuedRoutes();
-    const features = pairsMode
-      ? consolidateByStationPair(legs)
-      : curveLegs(legs);
-    currentPairFeatures = pairsMode ? features : null;
+    const features = consolidateByStationPair(currentFeatures());
+    currentPairFeatures = features;
     for (const feature of features) {
-      const cached = pairsMode && cachedRouteCoordinates(railRouteKey(feature));
+      const cached = cachedRouteCoordinates(railRouteKey(feature));
       if (cached) feature.geometry.coordinates = cached;
     }
     mapStatus.textContent = features.length
-      ? pairsMode
-        ? `Showing ${features.length} station pairs by journey count. Loading standard-gauge routes from OpenRailRouting…`
-        : `Showing ${features.length} legs. Hover a result to color its legs by operator; curves are visual only.`
+      ? `Showing ${features.length} station pairs. Loading by count × straight-line distance via OpenRailRouting…`
       : "Waiting for route results…";
     if (!features.length) {
       updateRoutingStatus();
@@ -744,27 +659,24 @@
       style: casingStyle,
       interactive: false,
       onEachFeature: (feature, layer) => {
-        if (pairsMode) routeLayersByKey.set(railRouteKey(feature), { casing: layer });
+        routeLayersByKey.set(railRouteKey(feature), { casing: layer });
       },
     }).addTo(routeMap);
     routeLayer = L.geoJSON(collection, {
       style: featureStyle,
       onEachFeature: (feature, layer) => {
         layer.bindPopup(makePopup(feature));
-        if (pairsMode) {
-          const key = railRouteKey(feature);
-          const layers = routeLayersByKey.get(key) || {};
-          layers.line = layer;
-          routeLayersByKey.set(key, layers);
-        }
+        const key = railRouteKey(feature);
+        const layers = routeLayersByKey.get(key) || {};
+        layers.line = layer;
+        routeLayersByKey.set(key, layers);
       },
     }).addTo(routeMap);
     warmLogoColors(features);
     if (hoveredJourneyRank !== null) setHoveredRoute(hoveredJourneyRank);
-    if (pairsMode) {
-      features.forEach((feature) => requestRailRoute(feature));
-      updateRoutingStatus();
-    }
+    features.forEach((feature) => requestRailRoute(feature));
+    updateRoutingStatus();
+    processRouteQueue();
 
     const bounds = routeLayer.getBounds();
     if (bounds.isValid() && (forceFit || !mapHasFittedData)) {
@@ -832,10 +744,7 @@
     const toolbar = document.createElement("div");
     toolbar.style.cssText = "display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:8px;font:14px sans-serif";
     const title = document.createElement("strong");
-    title.textContent = "Railfinder routes";
-    mapMode = document.createElement("select");
-    mapMode.setAttribute("aria-label", "Map data");
-    mapMode.innerHTML = '<option value="pairs">Station pairs (max speed)</option><option value="legs">All journey legs</option>';
+    title.textContent = "Railfinder station-pair routes";
     const close = document.createElement("button");
     close.type = "button";
     close.textContent = "Hide map";
@@ -844,12 +753,11 @@
     for (const button of [close]) {
       button.style.cssText = "padding:6px 10px;border:1px solid #94a3b8;border-radius:4px;background:white;cursor:pointer";
     }
-    toolbar.append(title, mapMode, close, mapStatus);
+    toolbar.append(title, close, mapStatus);
 
     mapContainer = document.createElement("div");
     mapContainer.style.cssText = "flex:1;min-height:0;width:100%;border-radius:4px";
     mapPane.append(toolbar, mapContainer);
-    mapMode.addEventListener("change", () => renderMap(true));
     close.addEventListener("click", closeMapPane);
   }
 
@@ -874,7 +782,7 @@
           attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap contributors</a>',
         }).addTo(routeMap);
         routeMap.attributionControl.addAttribution(
-          'Rail routes via <a href="https://routing.openrailrouting.org/">OpenRailRouting</a>; data © <a href="https://www.openstreetmap.org/copyright">OpenStreetMap contributors</a>',
+          '© <a href="https://routing.openrailrouting.org/">OpenRailRouting</a>, © <a href="https://www.openstreetmap.org/copyright">OpenStreetMap contributors</a>',
         );
         routeMap.setView([51, 7], 5);
       }
