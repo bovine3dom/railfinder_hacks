@@ -1,12 +1,16 @@
 // ==UserScript==
 // @name         Railfinder route map
 // @namespace    railfinder-hacks
-// @version      0.15.0
-// @description  Map Railfinder journey routes.
+// @version      0.17.3
+// @author       bovine3dom
+// @description  map for railfinder.eu search results
 // @match        https://www.railfinder.eu/search*
 // @run-at       document-idle
 // @require      https://cdn.jsdelivr.net/npm/leaflet@1.9.4/dist/leaflet.js
 // @resource     LEAFLET_CSS https://cdn.jsdelivr.net/npm/leaflet@1.9.4/dist/leaflet.css
+// @updateURL    https://raw.githubusercontent.com/bovine3dom/railfinder_hacks/master/src/content.user.js
+// @downloadURL  https://raw.githubusercontent.com/bovine3dom/railfinder_hacks/master/src/content.user.js
+// @supportURL   https://github.com/bovine3dom/railfinder_hacks/issues/
 // @grant        GM_addStyle
 // @grant        GM_getResourceText
 // ==/UserScript==
@@ -26,9 +30,13 @@
   const ROUTE_MAX_CACHE_MS = 30 * 24 * 60 * 60 * 1000;
   const journeyCards = new Set();
   const hoverTrackedCards = new WeakSet();
+  let mapLeaveTimer;
+  let selectedCard;
+  let resultsRoot;
   const logoColorPromises = new Map();
   const logoColors = new Map();
   const routeGeometryCache = new Map();
+  const displayRouteCache = new Map();
   const pendingRouteRequests = new Map();
   const routeFailures = new Map();
   const routeQueue = [];
@@ -38,15 +46,10 @@
   let nextRouteRequestAt = 0;
   let routeLayersByKey = new Map();
   let currentPairFeatures = null;
-  let resultsRoot;
-  let resultsPaneTop = 0;
-  let originalResultsStyle;
-  let originalBodyOverflow;
+  let pageRoot;
   let mapReopenButton;
   let mapPane;
   let mapContainer;
-  let mapStatus;
-  let mapProgress;
   let routeMap;
   let casingLayer;
   let routeLayer;
@@ -60,14 +63,33 @@
   let lastRenderedFeatureSignature = null;
 
   GM_addStyle(GM_getResourceText("LEAFLET_CSS"));
-  GM_addStyle(".railfinder-train-label-icon{background:transparent;border:0}.railfinder-map-label{display:inline-block;white-space:nowrap;line-height:1;-webkit-text-stroke:3px white;paint-order:stroke fill;text-shadow:0 0 2px white;pointer-events:none}");
+  GM_addStyle(`
+    .railfinder-train-label-icon{background:transparent;border:0}
+    .railfinder-map-label{display:inline-block;white-space:nowrap;line-height:1;-webkit-text-stroke:3px white;paint-order:stroke fill;text-shadow:0 0 2px white;pointer-events:none}
+    [data-railfinder-selected] > :first-child{outline:2px solid #d14d00;outline-offset:2px}
+    .railfinder-split-page{position:relative;width:50vw;min-width:0}
+    .railfinder-route-pane{position:fixed;inset:0 0 0 50vw;width:50vw;height:100vh;z-index:2147483646;box-sizing:border-box;padding:12px;background:#fff5f0;color:#122533;border-left:1px solid #ffd5bd;box-shadow:0 2px 10px #231f2026}
+    .railfinder-map-button{padding:6px 12px;border:1px solid #ff985c;border-radius:12px;background:white;color:#d14d00;cursor:pointer}
+    .railfinder-map-button:hover,.railfinder-map-button:focus-visible{background:#ffece0}
+    .railfinder-reopen-button{position:fixed;right:16px;bottom:16px;z-index:2147483647;box-shadow:0 2px 8px #231f2026}
+    @media(min-width:1100px){
+      .railfinder-split-page nav > div > div > [class~="sm:flex"]{display:none}
+      .railfinder-split-page nav > div > div > [class~="sm:hidden"]{display:flex}
+      .railfinder-split-page nav > [class~="sm:hidden"]:not(.hidden){display:block}
+    }
+    @media(max-width:1099px){
+      .railfinder-split-page{width:auto;padding-bottom:50vh}
+      .railfinder-route-pane{inset:auto 0 0;width:100vw;height:50vh;border-left:0;border-top:1px solid #ffd5bd}
+    }
+  `);
 
   function trackCard(card) {
     journeyCards.add(card);
     if (hoverTrackedCards.has(card)) return;
     hoverTrackedCards.add(card);
-    card.addEventListener("mouseenter", () => setHoveredRoute(card.dataset.rank));
-    card.addEventListener("mouseleave", () => setHoveredRoute(null));
+    card.addEventListener("mouseenter", () => {
+      if (mapVisible) setHoveredRoute(card.dataset.rank);
+    });
   }
 
   function rememberCards(node) {
@@ -187,7 +209,6 @@
 
     const durationSeconds = legDuration(info, card);
     const { departureTime, arrivalTime } = legTimes(info, times);
-    const straightLineDistanceKm = distanceKm(from, to);
     const operator = operatorFor(info, card, transport);
     const properties = {
       journeyRank: rankValue(card.dataset.rank),
@@ -201,9 +222,8 @@
       arrivalTime,
       operator: operator.name,
       operatorLogoUrl: operator.logoUrl,
-      durationSeconds,
       straightLineAverageSpeedKmh: durationSeconds
-        ? Number((straightLineDistanceKm / (durationSeconds / 3600)).toFixed(1))
+        ? Number((distanceKm(from, to) / (durationSeconds / 3600)).toFixed(1))
         : null,
     };
 
@@ -214,9 +234,15 @@
     };
   }
 
-  function currentFeatures() {
+  function currentFeatures(rank = null) {
     const features = [];
     for (const card of journeyCards) {
+      if (!card.isConnected) {
+        journeyCards.delete(card);
+        continue;
+      }
+      if ((rank !== null && rankValue(card.dataset.rank) !== rank)
+        || !card.getClientRects().length) continue;
       const infos = card.querySelectorAll(LEG_INFO);
       if (!infos.length) continue;
       const transports = card.querySelectorAll(TRANSPORT_NAME);
@@ -252,10 +278,7 @@
               toStationId: p.toStationId,
               count: 0,
               maxStraightLineAverageSpeedKmh: null,
-              maxSpeedDurationSeconds: null,
-              maxSpeedTransport: null,
-              operator: null,
-              operatorLogoUrl: null,
+              routeKey: railRouteKey(feature),
               operatorsByJourney: [],
             },
           },
@@ -280,10 +303,6 @@
       if (speed !== null && (properties.maxStraightLineAverageSpeedKmh === null
         || speed > properties.maxStraightLineAverageSpeedKmh)) {
         properties.maxStraightLineAverageSpeedKmh = speed;
-        properties.maxSpeedDurationSeconds = p.durationSeconds;
-        properties.maxSpeedTransport = p.transport;
-        properties.operator = p.operator;
-        properties.operatorLogoUrl = p.operatorLogoUrl;
       }
     }
     return [...pairs.values()].map(({ feature, journeyRanks }) => {
@@ -291,13 +310,6 @@
       feature.properties.journeyRanks = [...journeyRanks];
       return feature;
     });
-  }
-
-  function formatDuration(seconds) {
-    if (seconds === null || seconds === undefined) return "unknown";
-    const minutes = Math.round(seconds / 60);
-    const hours = Math.floor(minutes / 60);
-    return hours ? `${hours}h ${minutes % 60}m` : `${minutes}m`;
   }
 
   function operatorFallbackColor(name) {
@@ -377,15 +389,17 @@
         if (operatorLogoUrl) urls.add(operatorLogoUrl);
       });
     }
+    const layer = routeLayer;
     Promise.all([...urls].map(loadLogoColor)).then(() => {
-      if (!routeLayer) return;
+      if (routeLayer !== layer || !mapVisible) return;
       routeLayer.setStyle(featureStyle);
-      if (hoveredJourneyRank !== null) setHoveredRoute(hoveredJourneyRank);
+      if (hoveredJourneyRank !== null) setHoveredRoute(hoveredJourneyRank, true);
     });
   }
 
   function railRouteKey(feature) {
     const p = feature.properties;
+    if (p.routeKey) return p.routeKey;
     const coordinates = feature.geometry.coordinates;
     const endpoints = [coordinates[0], coordinates[coordinates.length - 1]]
       .map(([lon, lat]) => [lon.toFixed(5), lat.toFixed(5)]);
@@ -402,6 +416,18 @@
       && coordinates.every((point) => Array.isArray(point) && point.length >= 2
         && Number.isFinite(point[0]) && Number.isFinite(point[1])
         && Math.abs(point[0]) <= 180 && Math.abs(point[1]) <= 90);
+  }
+
+  function displayRouteCoordinates(key, coordinates) {
+    if (displayRouteCache.has(key)) return displayRouteCache.get(key);
+    const points = coordinates.map((coordinate) => {
+      const point = routeMap.project([coordinate[1], coordinate[0]], 14);
+      point.coordinates = coordinate;
+      return point;
+    });
+    const simplified = L.LineUtil.simplify(points, 1).map((point) => point.coordinates);
+    displayRouteCache.set(key, simplified);
+    return simplified;
   }
 
   function cachedRouteCoordinates(key) {
@@ -546,10 +572,8 @@
   }
 
   function updateRoutingStatus() {
-    if (!mapStatus || !currentPairFeatures?.length) return;
+    if (!currentPairFeatures?.length) return;
     if (routeServiceBlockedReason) {
-      mapStatus.textContent = `OpenRailRouting unavailable (${routeServiceBlockedReason}); unresolved pairs use straight lines.`;
-      mapProgress.hidden = true;
       return;
     }
     let ready = 0;
@@ -559,11 +583,6 @@
       if (cachedRouteCoordinates(key)) ready += 1;
       else if (pendingRouteRequests.has(key)) pending += 1;
     }
-    const fallback = currentPairFeatures.length - ready - pending;
-    mapStatus.textContent = `Rail routes: ${ready}/${currentPairFeatures.length} loaded; ${pending} pending${fallback ? `; ${fallback} using station-to-station lines` : ""}.`;
-    mapProgress.max = currentPairFeatures.length;
-    mapProgress.value = ready + fallback;
-    mapProgress.hidden = pending === 0;
   }
 
   function processRouteQueue() {
@@ -622,9 +641,11 @@
     promise.then((coordinates) => {
       const layer = routeLayersByKey.get(key);
       if (coordinates && layer && mapVisible) {
+        const display = displayRouteCoordinates(key, coordinates);
+        const latLngs = display.map(([lon, lat]) => [lat, lon]);
         for (const route of [layer.line, layer.casing]) {
-          route.feature.geometry.coordinates = coordinates;
-          route.setLatLngs(coordinates.map(([lon, lat]) => [lat, lon]));
+          route.feature.geometry.coordinates = display;
+          route.setLatLngs(latLngs);
         }
         if (hoveredJourneyRank !== null
           && layer.line.feature.properties.journeyRanks?.includes(hoveredJourneyRank)) {
@@ -645,34 +666,12 @@
     }
   }
 
-  function makePopup(feature) {
-    const p = feature.properties;
-    const content = document.createElement("div");
-    const rows = [
-      ["From", p.from],
-      ["To", p.to],
-      ["Count", p.count],
-      ["Leg duration", formatDuration(p.maxSpeedDurationSeconds)],
-      ["Max straight-line speed", p.maxStraightLineAverageSpeedKmh],
-      ["Operator", p.operator],
-      ["Transport", p.maxSpeedTransport ?? p.transport],
-    ];
-    for (const [label, value] of rows) {
-      if (value === undefined || value === null) continue;
-      const row = document.createElement("div");
-      row.textContent = `${label}: ${value}${label.includes("speed") ? " km/h" : ""}`;
-      content.append(row);
-    }
-    return content;
-  }
-
   function lineWeight(feature, selected = false) {
-    const count = feature.properties.count;
-    return selected || count === undefined ? 3 : Math.min(12, 2 + count);
+    return selected ? 3 : Math.min(12, 2 + feature.properties.count);
   }
 
   function isHoveredFeature(feature) {
-    return feature.properties.journeyRanks?.includes(hoveredJourneyRank);
+    return feature.properties.journeyRanks.includes(hoveredJourneyRank);
   }
 
   function featureStyle(feature) {
@@ -683,7 +682,7 @@
     if (hoveredJourneyRank === null) return { color: speedColor, weight: lineWeight(feature), opacity: 0.8 };
     if (!selected) return { color: speedColor, weight: lineWeight(feature), opacity: 0.12 };
 
-    const operator = p.operatorsByJourney?.find((entry) => entry.journeyRank === hoveredJourneyRank) || p;
+    const operator = p.operatorsByJourney.find((entry) => entry.journeyRank === hoveredJourneyRank);
     const color = logoColors.get(operator.operatorLogoUrl) || operatorFallbackColor(operator.operator);
     return { color, weight: lineWeight(feature, true), opacity: 1 };
   }
@@ -699,17 +698,20 @@
 
   function layoutHoveredLabels() {
     if (!trainLabelLayer) return;
+    const viewport = mapContainer.getBoundingClientRect();
     const labels = hoveredLabelRecords.map((label) => ({
       ...label,
       rect: label.element.getBoundingClientRect(),
     }));
     const placed = [];
+    const moves = [];
     for (const label of labels) {
       const { element, offsets, currentOffset, rect } = label;
-      let bestOffset = offsets[0];
+      if (rect.right < viewport.left || rect.left > viewport.right
+        || rect.bottom < viewport.top || rect.top > viewport.bottom) continue;
+      let bestOffset;
       let bestRect;
-      let fewestCollisions = Infinity;
-      for (const offset of offsets) {
+      const place = (offset) => {
         const dx = offset[0] - currentOffset[0];
         const dy = offset[1] - currentOffset[1];
         const candidate = {
@@ -718,20 +720,32 @@
           top: rect.top + dy,
           bottom: rect.bottom + dy,
         };
-        const collisions = placed.reduce((count, other) => count + (
-          candidate.left < other.right + 4 && candidate.right + 4 > other.left
-          && candidate.top < other.bottom + 4 && candidate.bottom + 4 > other.top ? 1 : 0
-        ), 0);
-        if (collisions < fewestCollisions) {
-          bestOffset = offset;
-          bestRect = candidate;
-          fewestCollisions = collisions;
+        if (candidate.right < viewport.left || candidate.left > viewport.right
+          || candidate.bottom < viewport.top || candidate.top > viewport.bottom
+          || placed.some((other) => candidate.left < other.right + 4
+            && candidate.right + 4 > other.left && candidate.top < other.bottom + 4
+            && candidate.bottom + 4 > other.top)) return false;
+        bestOffset = offset;
+        bestRect = candidate;
+        return true;
+      };
+      if (![currentOffset, ...offsets, [0, 0]].some(place)) {
+        const steps = Math.ceil(Math.max(viewport.width, viewport.height) / 28);
+        for (let step = 1; step <= steps; step += 1) {
+          if ([[0, -step], [0, step], [-step, 0], [step, 0],
+            [-step, -step], [step, -step], [-step, step], [step, step]]
+            .some(([x, y]) => place([x * 28, y * 28]))) break;
         }
-        if (collisions === 0) break;
       }
-      setLabelOffset(element, bestOffset);
-      label.currentOffset = bestOffset;
-      placed.push(bestRect);
+      moves.push({ element, label, bestOffset });
+      if (bestRect) placed.push(bestRect);
+    }
+    for (const { element, label, bestOffset } of moves) {
+      element.style.visibility = bestOffset ? "" : "hidden";
+      if (bestOffset) {
+        setLabelOffset(element, bestOffset);
+        label.currentOffset = bestOffset;
+      }
     }
   }
 
@@ -750,7 +764,7 @@
     if (!routeMap || !routeLayer || hoveredJourneyRank === null) return;
 
     const transport = document.querySelector(TRANSPORT_NAME);
-    const font = getComputedStyle(transport || resultsRoot || document.body);
+    const font = getComputedStyle(transport || pageRoot || document.body);
     const labels = L.layerGroup();
     const addLabel = (value, point, color, offsets, multiline = false) => {
       if (!value || !point) return;
@@ -812,8 +826,7 @@
       addLabel(journey.trainName, point, featureStyle(feature).color, offsets);
     });
 
-    const legs = currentFeatures()
-      .filter((feature) => feature.properties.journeyRank === hoveredJourneyRank)
+    const legs = currentFeatures(hoveredJourneyRank)
       .sort((a, b) => a.properties.legIndex - b.properties.legIndex);
     if (legs.length) {
       const first = legs[0];
@@ -845,12 +858,25 @@
     }
     if (labels.getLayers().length) {
       trainLabelLayer = labels.addTo(routeMap);
-      scheduleLabelLayout();
+      layoutHoveredLabels();
     }
   }
 
-  function setHoveredRoute(rank) {
-    hoveredJourneyRank = rank === null ? null : rankValue(rank);
+  function cardForRank(rank) {
+    for (const card of journeyCards) {
+      if (card.isConnected && rankValue(card.dataset.rank) === rank
+        && card.getClientRects().length) return card;
+    }
+    return null;
+  }
+
+  function setHoveredRoute(rank, force = false) {
+    const nextRank = rank === null ? null : rankValue(rank);
+    if (!force && hoveredJourneyRank === nextRank) return;
+    hoveredJourneyRank = nextRank;
+    selectedCard?.removeAttribute("data-railfinder-selected");
+    selectedCard = cardForRank(nextRank);
+    selectedCard?.setAttribute("data-railfinder-selected", "");
     if (!routeLayer) {
       renderHoveredTrainLabels();
       return;
@@ -865,6 +891,7 @@
 
   function renderMap(forceFit = false) {
     if (!routeMap) return;
+    if (hoveredJourneyRank !== null && !cardForRank(hoveredJourneyRank)) setHoveredRoute(null);
     const features = consolidateByStationPair(currentFeatures());
     const signature = JSON.stringify(features.map((feature) => [railRouteKey(feature), feature.properties]));
     if (signature === lastRenderedFeatureSignature) {
@@ -881,20 +908,15 @@
     renderHoveredTrainLabels();
     routeLayersByKey = new Map();
     currentPairFeatures = features;
-    if (!features.length) mapProgress.hidden = true;
     for (const feature of features) {
       const cached = cachedRouteCoordinates(railRouteKey(feature));
-      if (cached) feature.geometry.coordinates = cached;
+      if (cached) feature.geometry.coordinates = displayRouteCoordinates(railRouteKey(feature), cached);
     }
-    mapStatus.textContent = features.length
-      ? `Showing ${features.length} station pairs. Loading by count × straight-line distance via OpenRailRouting…`
-      : "Waiting for route results…";
     if (!features.length) {
       updateRoutingStatus();
       return;
     }
 
-    mapProgress.hidden = false;
     const collection = { type: "FeatureCollection", features };
     casingLayer = L.geoJSON(collection, {
       style: casingStyle,
@@ -908,15 +930,31 @@
       style: featureStyle,
       smoothFactor: 3,
       onEachFeature: (feature, layer) => {
-        layer.bindPopup(makePopup(feature));
         const key = railRouteKey(feature);
+        layer.on("mouseover", () => {
+          window.clearTimeout(mapLeaveTimer);
+          const rank = feature.properties.journeyRanks.find((value) => cardForRank(value));
+          if (rank !== undefined) setHoveredRoute(rank);
+        });
+        layer.on("mouseout", () => {
+          window.clearTimeout(mapLeaveTimer);
+          mapLeaveTimer = window.setTimeout(() => setHoveredRoute(null), 100);
+        });
+        layer.on("click", () => {
+          const rank = feature.properties.journeyRanks.find((value) => cardForRank(value));
+          const card = cardForRank(rank);
+          if (card) {
+            setHoveredRoute(rank);
+            card.scrollIntoView({ behavior: "smooth", block: window.innerWidth < 1100 ? "start" : "center" });
+          }
+        });
         const layers = routeLayersByKey.get(key) || {};
         layers.line = layer;
         routeLayersByKey.set(key, layers);
       },
     }).addTo(routeMap);
     warmLogoColors(features);
-    if (hoveredJourneyRank !== null) setHoveredRoute(hoveredJourneyRank);
+    if (hoveredJourneyRank !== null) setHoveredRoute(hoveredJourneyRank, true);
     features.forEach((feature) => requestRailRoute(feature));
     updateRoutingStatus();
     processRouteQueue();
@@ -928,52 +966,8 @@
     }
   }
 
-  function restoreResultsPane() {
-    if (!resultsRoot) return;
-    if (originalResultsStyle === null) resultsRoot.removeAttribute("style");
-    else resultsRoot.setAttribute("style", originalResultsStyle);
-  }
-
   function resizeMapPane() {
-    if (!mapVisible || !resultsRoot || !mapPane) return;
-    const wide = window.matchMedia("(min-width: 1100px)").matches;
-    if (wide) {
-      const top = Math.min(resultsPaneTop, Math.max(0, window.innerHeight - 240));
-      Object.assign(resultsRoot.style, {
-        display: "block",
-        position: "fixed",
-        inset: `${top}px auto auto 0`,
-        width: "50vw",
-        height: `calc(100vh - ${top}px)`,
-        minHeight: "0",
-        boxSizing: "border-box",
-        overflowY: "auto",
-        overflowX: "hidden",
-        zIndex: "2147483645",
-      });
-      Object.assign(mapPane.style, {
-        position: "fixed",
-        inset: `${top}px 0 0 50vw`,
-        width: "50vw",
-        height: `calc(100vh - ${top}px)`,
-        borderLeft: "1px solid #cbd5e1",
-        borderTop: "none",
-        zIndex: "2147483646",
-      });
-      document.body.style.overflow = "hidden";
-    } else {
-      restoreResultsPane();
-      document.body.style.overflow = originalBodyOverflow;
-      Object.assign(mapPane.style, {
-        position: "fixed",
-        inset: "auto 0 0 0",
-        width: "100vw",
-        height: "50vh",
-        borderLeft: "none",
-        borderTop: "1px solid #cbd5e1",
-        zIndex: "2147483646",
-      });
-    }
+    if (!mapVisible) return;
     if (routeMap) requestAnimationFrame(() => {
       routeMap.invalidateSize();
       scheduleLabelLayout();
@@ -981,65 +975,64 @@
   }
 
   function mountMapPane() {
-    if (resultsRoot) return true;
-    const card = [...journeyCards].find((item) => item.isConnected);
-    resultsRoot = document.querySelector("#results")
-      || card?.closest('[data-filter-target~="elementContainer"]')
-      || document.querySelector('[data-filter-target~="elementContainer"]');
-    if (!resultsRoot) return false;
-
-    resultsPaneTop = Math.max(0, resultsRoot.getBoundingClientRect().top);
-    originalResultsStyle = resultsRoot.getAttribute("style");
-    originalBodyOverflow = document.body.style.overflow;
-    document.body.append(mapPane);
+    const root = document.querySelector('[data-controller~="filter"]');
+    const results = root?.querySelector('#results, [data-filter-target~="elementContainer"]');
+    if (!results) return false;
+    pageRoot = root;
+    if (resultsRoot !== results) {
+      resultsRoot?.removeEventListener("mouseleave", leaveResults);
+      resultsRoot = results;
+      resultsRoot.addEventListener("mouseenter", () => window.clearTimeout(mapLeaveTimer));
+      resultsRoot.addEventListener("mouseleave", leaveResults);
+    }
+    if (mapPane.parentElement !== document.body) document.body.append(mapPane);
     return true;
   }
 
+  function leaveResults() {
+    setHoveredRoute(null);
+  }
+
   function closeMapPane() {
+    window.clearTimeout(mapLeaveTimer);
+    setHoveredRoute(null);
     mapVisible = false;
     mapPane.style.display = "none";
-    restoreResultsPane();
-    document.body.style.overflow = originalBodyOverflow;
+    pageRoot?.classList.remove("railfinder-split-page");
     window.removeEventListener("resize", resizeMapPane);
     cancelQueuedRoutes();
     if (!mapReopenButton) {
       mapReopenButton = document.createElement("button");
+      mapReopenButton.id = "railfinder-reopen-button";
       mapReopenButton.type = "button";
       mapReopenButton.textContent = "Open route map";
-      mapReopenButton.style.cssText = "position:fixed;right:16px;bottom:16px;z-index:2147483647;padding:8px 12px;border:1px solid #64748b;border-radius:6px;background:white;box-shadow:0 2px 8px #0003;cursor:pointer";
+      mapReopenButton.className = "railfinder-map-button railfinder-reopen-button";
       mapReopenButton.addEventListener("click", openMap);
-      document.body.append(mapReopenButton);
     }
+    if (!mapReopenButton.isConnected) document.body.append(mapReopenButton);
     mapReopenButton.hidden = false;
   }
 
   function createMapPane() {
     mapPane = document.createElement("section");
-    mapPane.style.cssText = "position:fixed;display:none;flex-direction:column;min-width:0;box-sizing:border-box;padding:12px;background:white;box-shadow:0 2px 10px #0002";
+    mapPane.id = "railfinder-route-pane";
+    mapPane.className = "railfinder-route-pane";
+    mapPane.style.display = "none";
+    mapPane.style.flexDirection = "column";
     mapPane.setAttribute("aria-label", "Rail route map");
 
     const toolbar = document.createElement("div");
-    toolbar.style.cssText = "display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:8px;font:14px sans-serif";
+    toolbar.style.cssText = "display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:8px;font:14px 'Apercu Pro',sans-serif";
     const title = document.createElement("strong");
-    title.textContent = "Railfinder station-pair routes";
-    mapProgress = document.createElement("progress");
-    mapProgress.max = 1;
-    mapProgress.value = 0;
-    mapProgress.setAttribute("aria-label", "Rail route loading progress");
-    mapProgress.style.cssText = "flex:1 1 100%;height:8px";
-    mapProgress.hidden = true;
+    title.textContent = "bovine3dom's unofficial route map";
     const close = document.createElement("button");
     close.type = "button";
     close.textContent = "Hide map";
-    mapStatus = document.createElement("span");
-    mapStatus.style.cssText = "flex:1 1 100%;color:#475569";
-    for (const button of [close]) {
-      button.style.cssText = "padding:6px 10px;border:1px solid #94a3b8;border-radius:4px;background:white;cursor:pointer";
-    }
-    toolbar.append(title, close, mapStatus, mapProgress);
+    close.className = "railfinder-map-button";
+    toolbar.append(title, close);
 
     mapContainer = document.createElement("div");
-    mapContainer.style.cssText = "flex:1;min-height:0;width:100%;border-radius:4px";
+    mapContainer.style.cssText = "flex:1;min-height:0;width:100%;border-radius:12px";
     mapPane.append(toolbar, mapContainer);
     close.addEventListener("click", closeMapPane);
   }
@@ -1047,28 +1040,28 @@
   function openMap() {
     if (!mapPane) createMapPane();
     if (!mountMapPane()) return false;
-    resultsPaneTop = Math.max(0, resultsRoot.getBoundingClientRect().top);
     mapReopenButton && (mapReopenButton.hidden = true);
     mapAutoStarted = true;
     mapVisible = true;
+    pageRoot.classList.add("railfinder-split-page");
     mapPane.style.display = "flex";
     window.addEventListener("resize", resizeMapPane);
     resizeMapPane();
     requestAnimationFrame(() => {
       if (typeof L === "undefined") {
-        mapStatus.textContent = "Leaflet did not load. Check the userscript CDN access.";
         return;
       }
       if (!routeMap) {
-        routeMap = L.map(mapContainer, { preferCanvas: true });
-        routeMap.on("zoomend moveend", scheduleLabelLayout);
+        routeMap = L.map(mapContainer);
+        routeMap.on("zoomend", () => window.setTimeout(layoutHoveredLabels, 0));
+        routeMap.on("moveend", scheduleLabelLayout);
         routeMap.getPane("tilePane").style.filter = "saturate(0)";
         L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", {
           maxZoom: 19,
           attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap contributors</a>',
         }).addTo(routeMap);
         routeMap.attributionControl.addAttribution(
-          '© <a href="https://routing.openrailrouting.org/">OpenRailRouting</a>, © <a href="https://www.openstreetmap.org/copyright">OpenStreetMap contributors</a>',
+          '© <a href="https://routing.openrailrouting.org/">OpenRailRouting</a>',
         );
         routeMap.setView([51, 7], 5);
       }
@@ -1078,6 +1071,50 @@
     });
     return true;
   }
+
+  function syncSearchPage() {
+    const root = document.querySelector('[data-controller~="filter"]');
+    const results = root?.querySelector('#results, [data-filter-target~="elementContainer"]');
+    if (!results) return;
+    if (!mapVisible) {
+      if (root.classList.contains("railfinder-split-page")) root.classList.remove("railfinder-split-page");
+      if (mapReopenButton && !mapReopenButton.isConnected) document.body.append(mapReopenButton);
+      return;
+    }
+    if (root === pageRoot && results === resultsRoot && mapPane.isConnected) return;
+    mountMapPane();
+    pageRoot.classList.add("railfinder-split-page");
+    pageRoot.querySelectorAll("[data-railfinder-selected]")
+      .forEach((card) => card.removeAttribute("data-railfinder-selected"));
+    setHoveredRoute(null);
+    mapHasFittedData = false;
+    requestAnimationFrame(() => {
+      if (!mapVisible || !mapPane.isConnected) return;
+      routeMap?.invalidateSize();
+      renderMap(true);
+    });
+  }
+
+  document.addEventListener("turbo:before-render", (event) => {
+    const newBody = event.detail?.newBody;
+    if (!newBody?.querySelector('[data-controller~="filter"]')) return;
+    newBody.querySelectorAll("[data-railfinder-selected]")
+      .forEach((card) => card.removeAttribute("data-railfinder-selected"));
+    for (const element of [mapPane, mapReopenButton]) {
+      const copy = element && newBody.querySelector(`#${element.id}`);
+      if (copy && copy !== element) copy.remove();
+    }
+  });
+  document.addEventListener("turbo:render", () => {
+    rememberCards(document.body);
+    syncSearchPage();
+  });
+  document.addEventListener("turbo:frame-render", (event) => {
+    if (event.target.id === "results") {
+      setHoveredRoute(null);
+      scheduleMapUpdate();
+    }
+  });
 
   function scheduleMapUpdate() {
     if (!mapVisible) return;
@@ -1093,6 +1130,7 @@
   const observer = new MutationObserver((records) => {
     let routesChanged = false;
     for (const record of records) {
+      if (mapPane?.contains(record.target)) continue;
       if (record.type === "attributes") {
         const card = record.target.matches("[data-rank]")
           ? record.target
@@ -1118,6 +1156,7 @@
       }
     }
     if (!mapAutoStarted && document.querySelector('[data-controller~="filter"]')) openMap();
+    syncSearchPage();
     if (routesChanged) scheduleMapUpdate();
   });
 
@@ -1138,6 +1177,9 @@
       "src",
       "srcset",
       "alt",
+      "class",
+      "hidden",
+      "style",
     ],
   });
   openMap();
