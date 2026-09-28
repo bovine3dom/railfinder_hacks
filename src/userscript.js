@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Railfinder route map
 // @namespace    railfinder-hacks
-// @version      0.10.0
+// @version      0.13.1
 // @description  Map Railfinder journey routes.
 // @match        https://www.railfinder.eu/search*
 // @run-at       document-idle
@@ -20,6 +20,7 @@
   const ROUTE_PROFILE = "all_tracks";
   const ROUTE_CACHE_PREFIX = "railfinder.openrailrouting.v1:";
   const ROUTE_MAX_RETRIES = 2;
+  const MAX_CONCURRENT_ROUTE_REQUESTS = 3;
   const ROUTE_TIMEOUT_MS = 20000;
   const ROUTE_DEFAULT_CACHE_MS = 7 * 24 * 60 * 60 * 1000;
   const ROUTE_MAX_CACHE_MS = 30 * 24 * 60 * 60 * 1000;
@@ -31,7 +32,8 @@
   const pendingRouteRequests = new Map();
   const routeFailures = new Map();
   const routeQueue = [];
-  let routeQueueActive = false;
+  let activeRouteRequests = 0;
+  let routeQueueTimer = null;
   let routeServiceBlockedReason = null;
   let nextRouteRequestAt = 0;
   let routeLayersByKey = new Map();
@@ -42,15 +44,19 @@
   let mapPane;
   let mapContainer;
   let mapStatus;
+  let mapProgress;
   let routeMap;
   let casingLayer;
   let routeLayer;
+  let trainLabelLayer;
   let hoveredJourneyRank = null;
   let mapVisible = false;
   let mapAutoStarted = false;
   let mapHasFittedData = false;
+  let lastRenderedFeatureSignature = null;
 
   GM_addStyle(GM_getResourceText("LEAFLET_CSS"));
+  GM_addStyle(".railfinder-train-label-icon{background:transparent;border:0}.railfinder-train-label-text{display:inline-block;white-space:nowrap;line-height:1;transform:translate(-50%,-50%);-webkit-text-stroke:3px white;paint-order:stroke fill;text-shadow:0 0 2px white;pointer-events:none}");
 
   function trackCard(card) {
     journeyCards.add(card);
@@ -125,12 +131,18 @@
     return 6371.0088 * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
   }
 
-  function cleanText(element) {
-    return element?.textContent.replace(/\s+/g, " ").trim() || null;
+  function cleanText(value) {
+    const text = typeof value === "string" ? value : value?.textContent;
+    return text?.replace(/\s+/g, " ").trim() || null;
   }
 
   function rankValue(rank) {
     return Number(rank) || rank;
+  }
+
+  function trainName(transport) {
+    const name = cleanText(transport);
+    return name?.split("•").at(-1).trim() || name;
   }
 
   function operatorFor(info, card, transport) {
@@ -226,6 +238,7 @@
           journeyRank: p.journeyRank,
           operator: p.operator,
           operatorLogoUrl: p.operatorLogoUrl,
+          trainName: trainName(p.transport),
         });
       }
       const speed = p.straightLineAverageSpeedKmh;
@@ -501,6 +514,7 @@
     if (!mapStatus || !currentPairFeatures?.length) return;
     if (routeServiceBlockedReason) {
       mapStatus.textContent = `OpenRailRouting unavailable (${routeServiceBlockedReason}); unresolved pairs use straight lines.`;
+      mapProgress.hidden = true;
       return;
     }
     let ready = 0;
@@ -512,34 +526,49 @@
     }
     const fallback = currentPairFeatures.length - ready - pending;
     mapStatus.textContent = `Rail routes: ${ready}/${currentPairFeatures.length} loaded; ${pending} pending${fallback ? `; ${fallback} using station-to-station lines` : ""}.`;
+    mapProgress.max = currentPairFeatures.length;
+    mapProgress.value = ready + fallback;
+    mapProgress.hidden = pending === 0;
   }
 
   function processRouteQueue() {
-    if (routeQueueActive || !routeQueue.length) return;
+    if (routeServiceBlockedReason) return cancelQueuedRoutes();
+    if (!routeQueue.length || activeRouteRequests >= MAX_CONCURRENT_ROUTE_REQUESTS) return;
+    const delay = nextRouteRequestAt - Date.now();
+    if (delay > 0) {
+      if (!routeQueueTimer) {
+        routeQueueTimer = window.setTimeout(() => {
+          routeQueueTimer = null;
+          processRouteQueue();
+        }, delay);
+      }
+      return;
+    }
+
     routeQueue.sort((a, b) => b.priority - a.priority);
-    routeQueueActive = true;
-    const job = routeQueue.shift();
-    fetchRailRoute(job.feature).then((result) => {
-      if (result) {
-        storeRouteCoordinates(job.key, result.coordinates, result.headers);
-        routeFailures.delete(job.key);
-        job.resolve(result.coordinates);
-      } else {
+    while (routeQueue.length && activeRouteRequests < MAX_CONCURRENT_ROUTE_REQUESTS) {
+      const job = routeQueue.shift();
+      activeRouteRequests += 1;
+      fetchRailRoute(job.feature).then((result) => {
+        if (result) {
+          storeRouteCoordinates(job.key, result.coordinates, result.headers);
+          routeFailures.delete(job.key);
+          job.resolve(result.coordinates);
+        } else {
+          routeFailures.set(job.key, Date.now() + 10 * 60 * 1000);
+          job.resolve(null);
+        }
+      }).catch(() => {
         routeFailures.set(job.key, Date.now() + 10 * 60 * 1000);
         job.resolve(null);
-      }
-    }).catch(() => {
-      routeFailures.set(job.key, Date.now() + 10 * 60 * 1000);
-      job.resolve(null);
-    }).finally(() => {
-      pendingRouteRequests.delete(job.key);
-      routeQueueActive = false;
-      if (routeServiceBlockedReason) cancelQueuedRoutes();
-      updateRoutingStatus();
-      if (routeQueue.length) {
-        window.setTimeout(processRouteQueue, Math.max(0, nextRouteRequestAt - Date.now()));
-      }
-    });
+      }).finally(() => {
+        pendingRouteRequests.delete(job.key);
+        activeRouteRequests -= 1;
+        if (routeServiceBlockedReason) cancelQueuedRoutes();
+        updateRoutingStatus();
+        processRouteQueue();
+      });
+    }
   }
 
   function requestRailRoute(feature) {
@@ -562,6 +591,10 @@
           route.feature.geometry.coordinates = coordinates;
           route.setLatLngs(coordinates.map(([lon, lat]) => [lat, lon]));
         }
+        if (hoveredJourneyRank !== null
+          && layer.line.feature.properties.journeyRanks?.includes(hoveredJourneyRank)) {
+          renderHoveredTrainLabels();
+        }
       }
       updateRoutingStatus();
     });
@@ -569,6 +602,8 @@
   }
 
   function cancelQueuedRoutes() {
+    if (routeQueueTimer) window.clearTimeout(routeQueueTimer);
+    routeQueueTimer = null;
     for (const job of routeQueue.splice(0)) {
       pendingRouteRequests.delete(job.key);
       job.resolve(null);
@@ -623,25 +658,76 @@
     return { ...style, color: "#fff", weight: style.weight + 2 };
   }
 
+  function renderHoveredTrainLabels() {
+    if (trainLabelLayer) routeMap.removeLayer(trainLabelLayer);
+    trainLabelLayer = null;
+    if (!routeMap || !routeLayer || hoveredJourneyRank === null) return;
+
+    const transport = document.querySelector(TRANSPORT_NAME);
+    const font = getComputedStyle(transport || resultsRoot || document.body);
+    const labels = L.layerGroup();
+    routeLayer.eachLayer((layer) => {
+      const feature = layer.feature;
+      if (!isHoveredFeature(feature)) return;
+      const journey = feature.properties.operatorsByJourney?.find(
+        (entry) => entry.journeyRank === hoveredJourneyRank,
+      );
+      if (!journey?.trainName) return;
+      const points = layer.getLatLngs();
+      const point = points[Math.floor(points.length / 2)];
+      if (!point) return;
+
+      const text = document.createElement("span");
+      text.className = "railfinder-train-label-text";
+      text.textContent = journey.trainName;
+      text.style.fontFamily = font.fontFamily;
+      text.style.fontSize = font.fontSize;
+      text.style.fontWeight = font.fontWeight;
+      text.style.color = featureStyle(feature).color;
+      const icon = L.divIcon({
+        className: "railfinder-train-label-icon",
+        html: text,
+        iconSize: [1, 1],
+        iconAnchor: [0, 0],
+      });
+      labels.addLayer(L.marker(point, { icon, interactive: false, keyboard: false }));
+    });
+    if (labels.getLayers().length) trainLabelLayer = labels.addTo(routeMap);
+  }
+
   function setHoveredRoute(rank) {
     hoveredJourneyRank = rank === null ? null : rankValue(rank);
-    if (!routeLayer) return;
+    if (!routeLayer) {
+      renderHoveredTrainLabels();
+      return;
+    }
     routeLayer.setStyle(featureStyle);
     casingLayer?.setStyle(casingStyle);
     routeLayer.eachLayer((layer) => {
       if (isHoveredFeature(layer.feature)) layer.bringToFront();
     });
+    renderHoveredTrainLabels();
   }
 
   function renderMap(forceFit = false) {
     if (!routeMap) return;
+    const features = consolidateByStationPair(currentFeatures());
+    const signature = JSON.stringify(features.map((feature) => [railRouteKey(feature), feature.properties]));
+    if (signature === lastRenderedFeatureSignature) {
+      if (forceFit && routeLayer) {
+        const bounds = routeLayer.getBounds();
+        if (bounds.isValid()) routeMap.fitBounds(bounds.pad(0.1), { maxZoom: 9 });
+      }
+      return;
+    }
+    lastRenderedFeatureSignature = signature;
     if (casingLayer) routeMap.removeLayer(casingLayer);
     if (routeLayer) routeMap.removeLayer(routeLayer);
     casingLayer = routeLayer = null;
+    renderHoveredTrainLabels();
     routeLayersByKey = new Map();
-
-    const features = consolidateByStationPair(currentFeatures());
     currentPairFeatures = features;
+    if (!features.length) mapProgress.hidden = true;
     for (const feature of features) {
       const cached = cachedRouteCoordinates(railRouteKey(feature));
       if (cached) feature.geometry.coordinates = cached;
@@ -654,6 +740,7 @@
       return;
     }
 
+    mapProgress.hidden = false;
     const collection = { type: "FeatureCollection", features };
     casingLayer = L.geoJSON(collection, {
       style: casingStyle,
@@ -745,6 +832,12 @@
     toolbar.style.cssText = "display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:8px;font:14px sans-serif";
     const title = document.createElement("strong");
     title.textContent = "Railfinder station-pair routes";
+    mapProgress = document.createElement("progress");
+    mapProgress.max = 1;
+    mapProgress.value = 0;
+    mapProgress.setAttribute("aria-label", "Rail route loading progress");
+    mapProgress.style.cssText = "flex:1 1 100%;height:8px";
+    mapProgress.hidden = true;
     const close = document.createElement("button");
     close.type = "button";
     close.textContent = "Hide map";
@@ -753,7 +846,7 @@
     for (const button of [close]) {
       button.style.cssText = "padding:6px 10px;border:1px solid #94a3b8;border-radius:4px;background:white;cursor:pointer";
     }
-    toolbar.append(title, close, mapStatus);
+    toolbar.append(title, close, mapStatus, mapProgress);
 
     mapContainer = document.createElement("div");
     mapContainer.style.cssText = "flex:1;min-height:0;width:100%;border-radius:4px";
@@ -776,7 +869,8 @@
         return;
       }
       if (!routeMap) {
-        routeMap = L.map(mapContainer);
+        routeMap = L.map(mapContainer, { preferCanvas: true });
+        routeMap.getPane("tilePane").style.filter = "saturate(0)";
         L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", {
           maxZoom: 19,
           attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap contributors</a>',
@@ -793,13 +887,12 @@
   }
 
   function scheduleMapUpdate() {
-    if (!mapVisible || mapUpdateTimer) return;
-    const delay = Math.max(0, 250 - (performance.now() - lastMapUpdate));
+    if (!mapVisible) return;
+    window.clearTimeout(mapUpdateTimer);
     mapUpdateTimer = window.setTimeout(() => {
       mapUpdateTimer = null;
-      lastMapUpdate = performance.now();
       if (mapVisible) renderMap();
-    }, delay);
+    }, 400);
   }
 
   rememberCards(document.documentElement);
@@ -836,7 +929,6 @@
   });
 
   let mapUpdateTimer;
-  let lastMapUpdate = 0;
   observer.observe(document.documentElement, {
     childList: true,
     subtree: true,
