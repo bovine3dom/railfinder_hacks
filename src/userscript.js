@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         Railfinder route GeoJSON
+// @name         Railfinder route map
 // @namespace    railfinder-hacks
-// @version      0.3.0
-// @description  Map and copy Railfinder journey legs.
+// @version      0.9.0
+// @description  Map Railfinder journey routes.
 // @match        https://www.railfinder.eu/search*
 // @run-at       document-idle
 // @require      https://cdn.jsdelivr.net/npm/leaflet@1.9.4/dist/leaflet.js
@@ -14,12 +14,30 @@
 (() => {
   "use strict";
 
-  const PANEL_ID = "railfinder-controls";
   const LEG_INFO = ".travel-leg-info";
   const TRANSPORT_NAME = ".travel-leg-transport-name";
   const MAX_CURVE_FRACTION = 0.12;
+  const OPEN_RAIL_ROUTING_URL = "https://routing.openrailrouting.org/route";
+  const ROUTE_PROFILE = "all_tracks";
+  const ROUTE_CACHE_PREFIX = "railfinder.openrailrouting.v1:";
+  const ROUTE_REQUEST_GAP_MS = 0;
+  const ROUTE_MAX_RETRIES = 2;
+  const ROUTE_TIMEOUT_MS = 20000;
+  const ROUTE_DEFAULT_CACHE_MS = 7 * 24 * 60 * 60 * 1000;
+  const ROUTE_MAX_CACHE_MS = 30 * 24 * 60 * 60 * 1000;
   const journeyCards = new Set();
   const hoverTrackedCards = new WeakSet();
+  const logoColorPromises = new Map();
+  const logoColors = new Map();
+  const routeGeometryCache = new Map();
+  const pendingRouteRequests = new Map();
+  const routeFailures = new Map();
+  const routeQueue = [];
+  let routeQueueActive = false;
+  let routeServiceBlockedReason = null;
+  let nextRouteRequestAt = 0;
+  let routeLayersByKey = new Map();
+  let currentPairFeatures = null;
   let resultsRoot;
   let originalResultsStyle;
   let originalBodyOverflow;
@@ -28,9 +46,12 @@
   let mapMode;
   let mapStatus;
   let routeMap;
+  let casingLayer;
   let routeLayer;
   let hoveredJourneyRank = null;
   let mapVisible = false;
+  let mapAutoStarted = false;
+  let mapHasFittedData = false;
 
   GM_addStyle(GM_getResourceText("LEAFLET_CSS"));
 
@@ -77,11 +98,19 @@
     return null;
   }
 
-  function legDuration(info, card) {
+  function legScope(info, card) {
     // Find the closest container that holds this leg's info and transport name.
     for (let element = info.parentElement; element && element !== card; element = element.parentElement) {
-      if (element.querySelectorAll(LEG_INFO).length !== 1) continue;
-      if (element.querySelectorAll(TRANSPORT_NAME).length !== 1) continue;
+      if (element.querySelectorAll(LEG_INFO).length === 1
+        && element.querySelectorAll(TRANSPORT_NAME).length === 1) return element;
+    }
+    return null;
+  }
+
+  function legDuration(info, card) {
+    for (let element = info.parentElement; element && element !== card; element = element.parentElement) {
+      if (element.querySelectorAll(LEG_INFO).length !== 1
+        || element.querySelectorAll(TRANSPORT_NAME).length !== 1) continue;
       const seconds = durationIn(element);
       if (seconds !== null) return seconds;
     }
@@ -107,6 +136,13 @@
     return Number(rank) || rank;
   }
 
+  function operatorFor(info, card, transport) {
+    const logo = legScope(info, card)?.querySelector("img[alt]");
+    const name = logo?.alt.trim() || cleanText(transport)?.split("•")[0].trim() || null;
+    const logoUrl = logo?.currentSrc || logo?.src || null;
+    return { name, logoUrl };
+  }
+
   function featureFor(card, info, index, transport) {
     const from = parsePoint(info.dataset.departurePoint);
     const to = parsePoint(info.dataset.arrivalPoint);
@@ -114,6 +150,7 @@
 
     const durationSeconds = legDuration(info, card);
     const straightLineDistanceKm = distanceKm(from, to);
+    const operator = operatorFor(info, card, transport);
     const properties = {
       journeyRank: rankValue(card.dataset.rank),
       leg: index + 1,
@@ -122,6 +159,8 @@
       fromStationId: info.dataset.departureStation || null,
       toStationId: info.dataset.arrivalStation || null,
       transport: cleanText(transport),
+      operator: operator.name,
+      operatorLogoUrl: operator.logoUrl,
       durationSeconds,
       straightLineDistanceKm: Number(straightLineDistanceKm.toFixed(2)),
       straightLineAverageSpeedKmh: durationSeconds
@@ -148,22 +187,6 @@
       });
     }
     return features;
-  }
-
-  async function copyText(text) {
-    try {
-      await navigator.clipboard.writeText(text);
-      return;
-    } catch {
-      const textarea = document.createElement("textarea");
-      textarea.value = text;
-      textarea.style.cssText = "position:fixed;left:-9999px;top:0";
-      document.body.append(textarea);
-      textarea.select();
-      const copied = document.execCommand("copy");
-      textarea.remove();
-      if (!copied) throw new Error("Clipboard access was blocked.");
-    }
   }
 
   function stationPairKey(feature) {
@@ -194,6 +217,9 @@
               maxSpeedJourneyRank: null,
               maxSpeedLeg: null,
               maxSpeedTransport: null,
+              operator: null,
+              operatorLogoUrl: null,
+              operatorsByJourney: [],
             },
           },
           journeyRanks: new Set(),
@@ -203,7 +229,14 @@
 
       const properties = pair.feature.properties;
       properties.legOccurrences += 1;
-      pair.journeyRanks.add(p.journeyRank);
+      if (!pair.journeyRanks.has(p.journeyRank)) {
+        pair.journeyRanks.add(p.journeyRank);
+        properties.operatorsByJourney.push({
+          journeyRank: p.journeyRank,
+          operator: p.operator,
+          operatorLogoUrl: p.operatorLogoUrl,
+        });
+      }
       const speed = p.straightLineAverageSpeedKmh;
       if (speed !== null && (properties.maxStraightLineAverageSpeedKmh === null
         || speed > properties.maxStraightLineAverageSpeedKmh)) {
@@ -212,6 +245,8 @@
         properties.maxSpeedJourneyRank = p.journeyRank;
         properties.maxSpeedLeg = p.leg;
         properties.maxSpeedTransport = p.transport;
+        properties.operator = p.operator;
+        properties.operatorLogoUrl = p.operatorLogoUrl;
       }
     }
     return [...pairs.values()].map(({ feature, journeyRanks }) => {
@@ -222,27 +257,332 @@
     });
   }
 
-  async function copyGeoJSON(button, features, successText) {
-    if (!features.length) {
-      button.textContent = "No journey legs found";
-      return;
-    }
-
-    try {
-      await copyText(JSON.stringify({ type: "FeatureCollection", features }, null, 2));
-      button.textContent = successText;
-    } catch (error) {
-      button.textContent = "Copy failed — check permissions";
-      console.error("Railfinder GeoJSON copy failed:", error);
-    }
-    window.setTimeout(() => { button.textContent = button.dataset.label; }, 2500);
-  }
-
   function formatDuration(seconds) {
     if (seconds === null || seconds === undefined) return "unknown";
     const minutes = Math.round(seconds / 60);
     const hours = Math.floor(minutes / 60);
     return hours ? `${hours}h ${minutes % 60}m` : `${minutes}m`;
+  }
+
+  function operatorFallbackColor(name) {
+    let hash = 0;
+    for (const character of name || "unknown") {
+      hash = Math.imul(hash ^ character.charCodeAt(0), 16777619);
+    }
+    return `hsl(${(hash >>> 0) % 360}, 70%, 40%)`;
+  }
+
+  function dominantLogoColor(image) {
+    const canvas = document.createElement("canvas");
+    canvas.width = 32;
+    canvas.height = 32;
+    const context = canvas.getContext("2d", { willReadFrequently: true });
+    if (!context) return null;
+    context.drawImage(image, 0, 0, 32, 32);
+    const pixels = context.getImageData(0, 0, 32, 32).data;
+    const colors = new Map();
+
+    for (let i = 0; i < pixels.length; i += 4) {
+      const red = pixels[i];
+      const green = pixels[i + 1];
+      const blue = pixels[i + 2];
+      if (pixels[i + 3] < 128 || (red > 235 && green > 235 && blue > 235)) continue;
+      const key = `${red >> 4},${green >> 4},${blue >> 4}`;
+      const color = colors.get(key) || { count: 0, red: 0, green: 0, blue: 0 };
+      color.count += 1;
+      color.red += red;
+      color.green += green;
+      color.blue += blue;
+      colors.set(key, color);
+    }
+
+    const dominant = [...colors.values()].sort((a, b) => b.count - a.count)[0];
+    if (!dominant) return null;
+    return `rgb(${Math.round(dominant.red / dominant.count)},${Math.round(dominant.green / dominant.count)},${Math.round(dominant.blue / dominant.count)})`;
+  }
+
+  function loadLogoColor(url) {
+    if (!url) return Promise.resolve(null);
+    if (logoColorPromises.has(url)) return logoColorPromises.get(url);
+    let source;
+    try {
+      source = new URL(url, location.href);
+    } catch {
+      return Promise.resolve(null);
+    }
+
+    const promise = new Promise((resolve) => {
+      const image = document.createElement("img");
+      if (source.origin !== location.origin) image.crossOrigin = "anonymous";
+      const readColor = () => {
+        try {
+          resolve(dominantLogoColor(image));
+        } catch {
+          resolve(null);
+        }
+      };
+      image.onload = readColor;
+      image.onerror = () => resolve(null);
+      image.src = source.href;
+      if (image.complete && image.naturalWidth) readColor();
+    }).then((color) => {
+      if (color) logoColors.set(url, color);
+      return color;
+    });
+    logoColorPromises.set(url, promise);
+    return promise;
+  }
+
+  function warmLogoColors(features) {
+    const urls = new Set();
+    for (const { properties } of features) {
+      if (properties.operatorLogoUrl) urls.add(properties.operatorLogoUrl);
+      properties.operatorsByJourney?.forEach(({ operatorLogoUrl }) => {
+        if (operatorLogoUrl) urls.add(operatorLogoUrl);
+      });
+    }
+    Promise.all([...urls].map(loadLogoColor)).then(() => {
+      if (!routeLayer) return;
+      routeLayer.setStyle(featureStyle);
+      if (hoveredJourneyRank !== null) setHoveredRoute(hoveredJourneyRank);
+    });
+  }
+
+  function railRouteKey(feature) {
+    const p = feature.properties;
+    const coordinates = feature.geometry.coordinates;
+    const endpoints = [coordinates[0], coordinates[coordinates.length - 1]]
+      .map(([lon, lat]) => [lon.toFixed(5), lat.toFixed(5)]);
+    return ROUTE_CACHE_PREFIX + encodeURIComponent(JSON.stringify([
+      ROUTE_PROFILE,
+      p.fromStationId || p.from,
+      p.toStationId || p.to,
+      endpoints,
+    ]));
+  }
+
+  function validRouteCoordinates(coordinates) {
+    return Array.isArray(coordinates) && coordinates.length >= 2
+      && coordinates.every((point) => Array.isArray(point) && point.length >= 2
+        && Number.isFinite(point[0]) && Number.isFinite(point[1])
+        && Math.abs(point[0]) <= 180 && Math.abs(point[1]) <= 90);
+  }
+
+  function cachedRouteCoordinates(key) {
+    if (routeGeometryCache.has(key)) return routeGeometryCache.get(key);
+    try {
+      const item = JSON.parse(localStorage.getItem(key));
+      if (item?.expiresAt > Date.now() && validRouteCoordinates(item.coordinates)) {
+        routeGeometryCache.set(key, item.coordinates);
+        return item.coordinates;
+      }
+      if (item) localStorage.removeItem(key);
+    } catch {
+      // Ignore unavailable or invalid local storage entries.
+    }
+    return null;
+  }
+
+  function routeCacheLifetime(headers) {
+    const directives = headers.get("Cache-Control") || "";
+    if (/\bno-store\b|\bno-cache\b/i.test(directives)) return 0;
+    const age = Math.max(0, Number(headers.get("Age")) || 0) * 1000;
+    const maxAge = directives.match(/(?:^|,)\s*max-age\s*=\s*"?(\d+)/i);
+    let lifetime = maxAge
+      ? Number(maxAge[1]) * 1000 - age
+      : Date.parse(headers.get("Expires") || "") - Date.now() - age;
+    if (!Number.isFinite(lifetime)) lifetime = ROUTE_DEFAULT_CACHE_MS;
+    return Math.max(0, Math.min(lifetime, ROUTE_MAX_CACHE_MS));
+  }
+
+  function storeRouteCoordinates(key, coordinates, headers) {
+    const lifetime = routeCacheLifetime(headers);
+    if (!lifetime) return;
+    routeGeometryCache.set(key, coordinates);
+    try {
+      localStorage.setItem(key, JSON.stringify({
+        expiresAt: Date.now() + lifetime,
+        coordinates,
+      }));
+    } catch {
+      // Keep the route in memory if local storage is full or blocked.
+    }
+  }
+
+  function retryAfterMilliseconds(response) {
+    const value = response.headers.get("Retry-After");
+    if (value) {
+      const seconds = Number(value);
+      if (Number.isFinite(seconds)) return Math.max(0, seconds * 1000);
+      const date = Date.parse(value);
+      if (Number.isFinite(date)) return Math.max(0, date - Date.now());
+    }
+
+    const reset = response.headers.get("RateLimit-Reset")
+      || response.headers.get("X-RateLimit-Reset");
+    if (reset === null) return null;
+    const resetValue = Number(reset);
+    if (Number.isFinite(resetValue)) {
+      return Math.max(0, resetValue > 1e9 ? resetValue * 1000 - Date.now() : resetValue * 1000);
+    }
+    const resetDate = Date.parse(reset);
+    return Number.isFinite(resetDate) ? Math.max(0, resetDate - Date.now()) : null;
+  }
+
+  function waitUntil(timestamp) {
+    return new Promise((resolve) => {
+      const poll = () => {
+        const remaining = timestamp - Date.now();
+        if (remaining <= 0) resolve();
+        else window.setTimeout(poll, Math.min(remaining, 2_147_000_000));
+      };
+      poll();
+    });
+  }
+
+  async function fetchRailRoute(feature) {
+    const [from, to] = feature.geometry.coordinates.length === 2
+      ? feature.geometry.coordinates
+      : [feature.geometry.coordinates[0], feature.geometry.coordinates.at(-1)];
+    const url = new URL(OPEN_RAIL_ROUTING_URL);
+    for (const [lon, lat] of [from, to]) url.searchParams.append("point", `${lat},${lon}`);
+    url.searchParams.set("profile", ROUTE_PROFILE);
+    url.searchParams.set("instructions", "false");
+    url.searchParams.set("points_encoded", "false");
+
+    for (let attempt = 0; attempt <= ROUTE_MAX_RETRIES; attempt += 1) {
+      await waitUntil(nextRouteRequestAt);
+      nextRouteRequestAt = Date.now() + ROUTE_REQUEST_GAP_MS;
+      const controller = new AbortController();
+      const timeout = window.setTimeout(() => controller.abort(), ROUTE_TIMEOUT_MS);
+      let response;
+      try {
+        response = await fetch(url, {
+          cache: "default",
+          headers: { Accept: "application/json" },
+          signal: controller.signal,
+        });
+        if (/text\/html/i.test(response.headers.get("Content-Type") || "")) {
+          routeServiceBlockedReason = "challenge page returned";
+          return null;
+        }
+        if ([401, 403, 404, 501].includes(response.status)) {
+          routeServiceBlockedReason = response.status === 501
+            ? "requested profile unsupported"
+            : "authentication, endpoint, or access denied";
+          return null;
+        }
+        if (response.ok) {
+          const data = await response.json();
+          const points = data.paths?.[0]?.points;
+          const coordinates = points?.coordinates || points;
+          if (!Array.isArray(coordinates)) {
+            if (data.paths?.length) routeServiceBlockedReason = "unexpected geometry format";
+            return null;
+          }
+          if (!validRouteCoordinates(coordinates)) return null;
+          return { coordinates: coordinates.map(([lon, lat]) => [lon, lat]), headers: response.headers };
+        }
+      } catch (error) {
+        if (error instanceof TypeError || error instanceof SyntaxError) {
+          routeServiceBlockedReason = error instanceof TypeError
+            ? "CORS or network error"
+            : "invalid response (possibly a challenge)";
+          return null;
+        }
+        const delay = 1500 * 2 ** attempt + Math.random() * 500;
+        nextRouteRequestAt = Math.max(nextRouteRequestAt, Date.now() + delay);
+        if (attempt === ROUTE_MAX_RETRIES) return null;
+        continue;
+      } finally {
+        window.clearTimeout(timeout);
+      }
+
+      const retryAfter = retryAfterMilliseconds(response);
+      if (retryAfter !== null) {
+        nextRouteRequestAt = Math.max(nextRouteRequestAt, Date.now() + retryAfter);
+      }
+      const retryable = response.status === 408 || response.status === 429 || response.status >= 500;
+      if (!retryable || attempt === ROUTE_MAX_RETRIES) return null;
+      const backoff = retryAfter ?? (response.status === 429 ? 30000 : 5000) * 2 ** attempt;
+      nextRouteRequestAt = Math.max(nextRouteRequestAt, Date.now() + backoff);
+    }
+    return null;
+  }
+
+  function updateRoutingStatus() {
+    if (!mapStatus || !currentPairFeatures?.length || mapMode.value !== "pairs") return;
+    if (routeServiceBlockedReason) {
+      mapStatus.textContent = `OpenRailRouting unavailable (${routeServiceBlockedReason}); unresolved pairs use straight lines.`;
+      return;
+    }
+    let ready = 0;
+    let pending = 0;
+    for (const feature of currentPairFeatures) {
+      const key = railRouteKey(feature);
+      if (cachedRouteCoordinates(key)) ready += 1;
+      else if (pendingRouteRequests.has(key)) pending += 1;
+    }
+    const fallback = currentPairFeatures.length - ready - pending;
+    mapStatus.textContent = `Rail routes: ${ready}/${currentPairFeatures.length} loaded; ${pending} pending${fallback ? `; ${fallback} using station-to-station lines` : ""}.`;
+  }
+
+  function processRouteQueue() {
+    if (routeQueueActive || !routeQueue.length) return;
+    routeQueueActive = true;
+    const job = routeQueue.shift();
+    fetchRailRoute(job.feature).then((result) => {
+      if (result) {
+        storeRouteCoordinates(job.key, result.coordinates, result.headers);
+        routeFailures.delete(job.key);
+        job.resolve(result.coordinates);
+      } else {
+        routeFailures.set(job.key, Date.now() + 10 * 60 * 1000);
+        job.resolve(null);
+      }
+    }).catch(() => {
+      routeFailures.set(job.key, Date.now() + 10 * 60 * 1000);
+      job.resolve(null);
+    }).finally(() => {
+      pendingRouteRequests.delete(job.key);
+      routeQueueActive = false;
+      if (routeServiceBlockedReason) cancelQueuedRoutes();
+      updateRoutingStatus();
+      if (routeQueue.length) {
+        window.setTimeout(processRouteQueue, Math.max(0, nextRouteRequestAt - Date.now()));
+      }
+    });
+  }
+
+  function requestRailRoute(feature) {
+    if (routeServiceBlockedReason) return Promise.resolve(null);
+    const key = railRouteKey(feature);
+    const cached = cachedRouteCoordinates(key);
+    if (cached) return Promise.resolve(cached);
+    if (pendingRouteRequests.has(key)) return pendingRouteRequests.get(key);
+    if ((routeFailures.get(key) || 0) > Date.now()) return Promise.resolve(null);
+
+    const promise = new Promise((resolve) => routeQueue.push({ key, feature, resolve }));
+    pendingRouteRequests.set(key, promise);
+    promise.then((coordinates) => {
+      const layer = routeLayersByKey.get(key);
+      if (coordinates && layer && mapVisible && mapMode.value === "pairs") {
+        for (const route of [layer.line, layer.casing]) {
+          route.feature.geometry.coordinates = coordinates;
+          route.setLatLngs(coordinates.map(([lon, lat]) => [lat, lon]));
+        }
+      }
+      updateRoutingStatus();
+    });
+    processRouteQueue();
+    return promise;
+  }
+
+  function cancelQueuedRoutes() {
+    for (const job of routeQueue.splice(0)) {
+      pendingRouteRequests.delete(job.key);
+      job.resolve(null);
+    }
   }
 
   function makePopup(feature) {
@@ -254,6 +594,7 @@
       ["Count", p.count],
       ["Leg duration", formatDuration(p.maxSpeedDurationSeconds ?? p.durationSeconds)],
       ["Max straight-line speed", p.maxStraightLineAverageSpeedKmh ?? p.straightLineAverageSpeedKmh],
+      ["Operator", p.operator],
       ["Transport", p.maxSpeedTransport ?? p.transport],
     ];
     if (p.journeyRank !== undefined) rows.push(["Journey", p.journeyRank], ["Leg", p.leg]);
@@ -330,56 +671,106 @@
     return curved;
   }
 
+  function lineWeight(feature, selected = false) {
+    const count = feature.properties.count;
+    return selected || count === undefined ? 3 : Math.min(12, 2 + count);
+  }
+
+  function isHoveredFeature(feature) {
+    const p = feature.properties;
+    return p.journeyRank === hoveredJourneyRank || p.journeyRanks?.includes(hoveredJourneyRank);
+  }
+
   function featureStyle(feature) {
     const p = feature.properties;
     const speed = p.maxStraightLineAverageSpeedKmh ?? p.straightLineAverageSpeedKmh;
-    const weight = p.count === undefined ? 3 : Math.min(12, 2 + p.count);
-    const color = speed >= 100 ? "#dc2626" : speed >= 60 ? "#ea580c" : "#2563eb";
-    const selected = p.journeyRank === hoveredJourneyRank
-      || p.journeyRanks?.includes(hoveredJourneyRank);
-    if (hoveredJourneyRank === null) return { color, weight, opacity: 0.8 };
-    return selected
-      ? { color: "#e11d48", weight: weight + 3, opacity: 1 }
-      : { color, weight, opacity: 0.12 };
+    const speedColor = speed >= 100 ? "#dc2626" : speed >= 60 ? "#ea580c" : "#2563eb";
+    const selected = isHoveredFeature(feature);
+    if (hoveredJourneyRank === null) return { color: speedColor, weight: lineWeight(feature), opacity: 0.8 };
+    if (!selected) return { color: speedColor, weight: lineWeight(feature), opacity: 0.12 };
+
+    const operator = p.journeyRank === hoveredJourneyRank
+      ? p
+      : p.operatorsByJourney?.find((entry) => entry.journeyRank === hoveredJourneyRank) || p;
+    const color = logoColors.get(operator.operatorLogoUrl) || operatorFallbackColor(operator.operator);
+    return { color, weight: lineWeight(feature, true), opacity: 1 };
+  }
+
+  function casingStyle(feature) {
+    const style = featureStyle(feature);
+    return { ...style, color: "#fff", weight: style.weight + 2 };
   }
 
   function setHoveredRoute(rank) {
     hoveredJourneyRank = rank === null ? null : rankValue(rank);
     if (!routeLayer) return;
+    routeLayer.setStyle(featureStyle);
+    casingLayer?.setStyle(casingStyle);
     routeLayer.eachLayer((layer) => {
-      layer.setStyle(featureStyle(layer.feature));
-      const p = layer.feature.properties;
-      if (p.journeyRank === hoveredJourneyRank || p.journeyRanks?.includes(hoveredJourneyRank)) {
-        layer.bringToFront();
-      }
+      if (isHoveredFeature(layer.feature)) layer.bringToFront();
     });
   }
 
-  function renderMap() {
+  function renderMap(forceFit = false) {
     if (!routeMap) return;
+    if (casingLayer) routeMap.removeLayer(casingLayer);
     if (routeLayer) routeMap.removeLayer(routeLayer);
-    routeLayer = null;
+    casingLayer = routeLayer = null;
+    routeLayersByKey = new Map();
 
     const legs = currentFeatures();
     const pairsMode = mapMode.value === "pairs";
+    if (!pairsMode) cancelQueuedRoutes();
     const features = pairsMode
       ? consolidateByStationPair(legs)
       : curveLegs(legs);
+    currentPairFeatures = pairsMode ? features : null;
+    for (const feature of features) {
+      const cached = pairsMode && cachedRouteCoordinates(railRouteKey(feature));
+      if (cached) feature.geometry.coordinates = cached;
+    }
     mapStatus.textContent = features.length
       ? pairsMode
-        ? `Showing ${features.length} station pairs. Hover a result to highlight its pairs.`
-        : `Showing ${features.length} legs. Hover a result to highlight it; curves are visual only.`
-      : "No route legs are available.";
-    if (!features.length) return;
+        ? `Showing ${features.length} station pairs by journey count. Loading standard-gauge routes from OpenRailRouting…`
+        : `Showing ${features.length} legs. Hover a result to color its legs by operator; curves are visual only.`
+      : "Waiting for route results…";
+    if (!features.length) {
+      updateRoutingStatus();
+      return;
+    }
 
-    routeLayer = L.geoJSON({ type: "FeatureCollection", features }, {
-      style: featureStyle,
-      onEachFeature: (feature, layer) => layer.bindPopup(makePopup(feature)),
+    const collection = { type: "FeatureCollection", features };
+    casingLayer = L.geoJSON(collection, {
+      style: casingStyle,
+      interactive: false,
+      onEachFeature: (feature, layer) => {
+        if (pairsMode) routeLayersByKey.set(railRouteKey(feature), { casing: layer });
+      },
     }).addTo(routeMap);
+    routeLayer = L.geoJSON(collection, {
+      style: featureStyle,
+      onEachFeature: (feature, layer) => {
+        layer.bindPopup(makePopup(feature));
+        if (pairsMode) {
+          const key = railRouteKey(feature);
+          const layers = routeLayersByKey.get(key) || {};
+          layers.line = layer;
+          routeLayersByKey.set(key, layers);
+        }
+      },
+    }).addTo(routeMap);
+    warmLogoColors(features);
     if (hoveredJourneyRank !== null) setHoveredRoute(hoveredJourneyRank);
+    if (pairsMode) {
+      features.forEach((feature) => requestRailRoute(feature));
+      updateRoutingStatus();
+    }
 
     const bounds = routeLayer.getBounds();
-    if (bounds.isValid()) routeMap.fitBounds(bounds.pad(0.1), { maxZoom: 9 });
+    if (bounds.isValid() && (forceFit || !mapHasFittedData)) {
+      routeMap.fitBounds(bounds.pad(0.1), { maxZoom: 9 });
+      mapHasFittedData = true;
+    }
   }
 
   function resizeMapPane() {
@@ -411,7 +802,8 @@
   function mountMapPane() {
     if (resultsRoot) return true;
     const card = [...journeyCards].find((item) => item.isConnected);
-    resultsRoot = card?.closest('[data-controller~="filter"]');
+    resultsRoot = document.querySelector('[data-controller~="filter"]')
+      || card?.closest('[data-controller~="filter"]');
     if (!resultsRoot) return false;
 
     originalResultsStyle = resultsRoot.getAttribute("style");
@@ -429,8 +821,7 @@
     }
     document.body.style.overflow = originalBodyOverflow;
     window.removeEventListener("resize", resizeMapPane);
-    const controls = document.getElementById(PANEL_ID);
-    if (controls) controls.style.display = "flex";
+    cancelQueuedRoutes();
   }
 
   function createMapPane() {
@@ -445,36 +836,31 @@
     mapMode = document.createElement("select");
     mapMode.setAttribute("aria-label", "Map data");
     mapMode.innerHTML = '<option value="pairs">Station pairs (max speed)</option><option value="legs">All journey legs</option>';
-    const refresh = document.createElement("button");
-    refresh.type = "button";
-    refresh.textContent = "Refresh";
     const close = document.createElement("button");
     close.type = "button";
-    close.textContent = "Close map";
+    close.textContent = "Hide map";
     mapStatus = document.createElement("span");
     mapStatus.style.cssText = "flex:1 1 100%;color:#475569";
-    for (const button of [refresh, close]) {
+    for (const button of [close]) {
       button.style.cssText = "padding:6px 10px;border:1px solid #94a3b8;border-radius:4px;background:white;cursor:pointer";
     }
-    toolbar.append(title, mapMode, refresh, close, mapStatus);
+    toolbar.append(title, mapMode, close, mapStatus);
 
     mapContainer = document.createElement("div");
     mapContainer.style.cssText = "flex:1;min-height:0;width:100%;border-radius:4px";
     mapPane.append(toolbar, mapContainer);
-    mapMode.addEventListener("change", renderMap);
-    refresh.addEventListener("click", renderMap);
+    mapMode.addEventListener("change", () => renderMap(true));
     close.addEventListener("click", closeMapPane);
   }
 
   function openMap() {
     if (!mapPane) createMapPane();
-    if (!mountMapPane()) return;
+    if (!mountMapPane()) return false;
+    mapAutoStarted = true;
     mapVisible = true;
     mapPane.style.display = "flex";
     document.body.style.overflow = "hidden";
     window.addEventListener("resize", resizeMapPane);
-    const controls = document.getElementById(PANEL_ID);
-    if (controls) controls.style.display = "none";
     resizeMapPane();
     requestAnimationFrame(() => {
       if (typeof L === "undefined") {
@@ -487,71 +873,78 @@
           maxZoom: 19,
           attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap contributors</a>',
         }).addTo(routeMap);
+        routeMap.attributionControl.addAttribution(
+          'Rail routes via <a href="https://routing.openrailrouting.org/">OpenRailRouting</a>; data © <a href="https://www.openstreetmap.org/copyright">OpenStreetMap contributors</a>',
+        );
         routeMap.setView([51, 7], 5);
       }
       routeMap.invalidateSize();
-      renderMap();
+      renderMap(true);
     });
+    return true;
   }
 
-  function addButton() {
-    if (document.getElementById(PANEL_ID) || !currentFeatures().length) return;
-
-    const panel = document.createElement("div");
-    panel.id = PANEL_ID;
-    panel.style.cssText = "position:fixed;right:16px;bottom:16px;z-index:2147483647;display:flex;flex-direction:column;gap:8px";
-
-    const makeButton = (label, action) => {
-      const button = document.createElement("button");
-      button.type = "button";
-      button.dataset.label = label;
-      button.textContent = label;
-      button.style.cssText = [
-        "padding:10px 14px", "border:0", "border-radius:6px", "background:#164e63",
-        "color:white", "font:600 14px sans-serif", "cursor:pointer",
-        "box-shadow:0 2px 8px #0004",
-      ].join(";");
-      button.addEventListener("click", () => action(button));
-      return button;
-    };
-
-    panel.append(
-      makeButton("Copy all routes as GeoJSON", (button) => {
-        const legs = currentFeatures();
-        const routes = new Set(legs.map(({ properties }) => properties.journeyRank)).size;
-        copyGeoJSON(button, legs, `Copied ${routes} routes / ${legs.length} legs`);
-      }),
-      makeButton("Copy station pairs (max speed)", (button) => {
-        const legs = currentFeatures();
-        const pairs = consolidateByStationPair(legs);
-        copyGeoJSON(button, pairs, `Copied ${pairs.length} pairs / ${legs.length} legs`);
-      }),
-      makeButton("Show map pane", openMap),
-    );
-    document.body.append(panel);
+  function scheduleMapUpdate() {
+    if (!mapVisible || mapUpdateTimer) return;
+    const delay = Math.max(0, 250 - (performance.now() - lastMapUpdate));
+    mapUpdateTimer = window.setTimeout(() => {
+      mapUpdateTimer = null;
+      lastMapUpdate = performance.now();
+      if (mapVisible) renderMap();
+    }, delay);
   }
 
   rememberCards(document.documentElement);
 
-  let scheduled = false;
   const observer = new MutationObserver((records) => {
+    let routesChanged = false;
     for (const record of records) {
-      if (record.type === "attributes") rememberCards(record.target);
-      else record.addedNodes.forEach(rememberCards);
+      if (record.type === "attributes") {
+        const card = record.target.matches("[data-rank]")
+          ? record.target
+          : record.target.closest("[data-rank]");
+        if (card) {
+          rememberCards(card);
+          routesChanged = true;
+        }
+        continue;
+      }
+
+      const target = record.target.nodeType === Node.ELEMENT_NODE
+        ? record.target
+        : record.target.parentElement;
+      const targetCard = target?.closest("[data-rank]");
+      if (targetCard && journeyCards.has(targetCard)) routesChanged = true;
+      for (const node of record.addedNodes) {
+        if (node instanceof Element
+          && (node.matches("[data-rank]") || node.querySelector("[data-rank]"))) {
+          routesChanged = true;
+        }
+        rememberCards(node);
+      }
     }
-    if (scheduled) return;
-    scheduled = true;
-    requestAnimationFrame(() => {
-      scheduled = false;
-      addButton();
-    });
+    if (!mapAutoStarted && document.querySelector('[data-controller~="filter"]')) openMap();
+    if (routesChanged) scheduleMapUpdate();
   });
 
+  let mapUpdateTimer;
+  let lastMapUpdate = 0;
   observer.observe(document.documentElement, {
     childList: true,
     subtree: true,
     attributes: true,
-    attributeFilter: ["data-rank"],
+    attributeFilter: [
+      "data-rank",
+      "data-departure-station",
+      "data-departure-station-name",
+      "data-departure-point",
+      "data-arrival-station",
+      "data-arrival-station-name",
+      "data-arrival-point",
+      "src",
+      "srcset",
+      "alt",
+    ],
   });
-  addButton();
+  openMap();
 })();
