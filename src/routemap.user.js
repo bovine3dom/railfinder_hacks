@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Railfinder route map
 // @namespace    railfinder-hacks
-// @version      0.18.3
+// @version      0.18.4
 // @author       bovine3dom
 // @description  map for railfinder.eu search results
 // @match        https://www.railfinder.eu/*
@@ -840,7 +840,7 @@
     const results = root?.querySelector('#results, [data-filter-target~="elementContainer"]');
     if (!results) return;
     if (!mapVisible) {
-      root.classList.remove("railfinder-split-page");
+      if (root.classList.contains("railfinder-split-page")) root.classList.remove("railfinder-split-page");
       if (mapReopenButton && !mapReopenButton.isConnected) document.body.append(mapReopenButton);
       return;
     }
