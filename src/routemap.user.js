@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Railfinder route map
 // @namespace    railfinder-hacks
-// @version      0.18.5
+// @version      0.18.6
 // @author       bovine3dom
 // @description  map for railfinder.eu search results
 // @match        https://www.railfinder.eu/*
@@ -25,6 +25,8 @@
   const ROUTE_PROFILE = "all_tracks";
   const ROUTE_CACHE_PREFIX = "railfinder.openrailrouting.v2:";
   const ROUTE_MAX_RETRIES = 2;
+  const ROUTE_RETRY_MS = 10 * 60 * 1000;
+  const ROUTE_DO_NOT_RETRY_MS = 192 * 60 * 60 * 1000; // i guess in theory they could fix their code
   const MAX_CONCURRENT_ROUTE_REQUESTS = 3;
   const ROUTE_TIMEOUT_MS = 20000;
   const journeyCards = new Set(), hoverTrackedCards = new WeakSet();
@@ -36,7 +38,7 @@
   let cacheWarningShown = false, activeRouteRequests = 0, routeQueueTimer = null;
   let routeServiceBlockedReason = null, nextRouteRequestAt = 0, routeLayersByKey = new Map();
   let hoveredLabelRecords = [], labelLayoutFrame = 0, hoveredJourneyRank = null;
-  let mapVisible = false, mapAutoStarted = false, mapHasFittedData = false;
+  let mapVisible = false, mapAutoStarted = false, mapHasFittedData = false, mapUpdateTimer;
   let lastRenderedFeatureSignature = null, renderGeneration = 0;
 
   GM_addStyle(GM_getResourceText("LEAFLET_CSS"));
@@ -409,8 +411,8 @@
       poll();
     });
   }
-  async function fetchRailRoute(feature) {
-    const coords = feature.geometry.coordinates, from = coords[0], to = coords.at(-1);
+  async function fetchRailRoute(job) {
+    const feature = job.feature, coords = feature.geometry.coordinates, from = coords[0], to = coords.at(-1);
     const url = new URL(OPEN_RAIL_ROUTING_URL);
     for (const [lon, lat] of [from, to]) url.searchParams.append("point", `${lat},${lon}`);
     url.searchParams.set("profile", ROUTE_PROFILE);
@@ -452,7 +454,10 @@
       const retryAfter = retryAfterMilliseconds(response);
       if (retryAfter !== null) nextRouteRequestAt = Math.max(nextRouteRequestAt, Date.now() + retryAfter);
       const retryable = response.status === 408 || response.status === 429 || response.status >= 500;
-      if (!retryable || attempt === ROUTE_MAX_RETRIES) return null;
+      if (!retryable || attempt === ROUTE_MAX_RETRIES) {
+        job.permanent = !retryable;
+        return null;
+      }
       const backoff = retryAfter ?? (response.status === 429 ? 30000 : 5000) * 2 ** attempt;
       nextRouteRequestAt = Math.max(nextRouteRequestAt, Date.now() + backoff);
     }
@@ -473,14 +478,14 @@
     while (routeQueue.length && activeRouteRequests < MAX_CONCURRENT_ROUTE_REQUESTS) {
       const job = routeQueue.shift();
       activeRouteRequests++;
-      fetchRailRoute(job.feature).then(async (coordinates) => {
+      fetchRailRoute(job).then(async (coordinates) => {
         if (coordinates) {
           await storeRouteCoordinates(job.key, orientRoute(job.feature, coordinates));
           routeFailures.delete(job.key);
-        } else routeFailures.set(job.key, Date.now() + 10 * 60 * 1000);
+        } else routeFailures.set(job.key, Date.now() + (job.permanent ? ROUTE_DO_NOT_RETRY_MS : ROUTE_RETRY_MS));
         job.resolve(coordinates);
       }).catch(() => {
-        routeFailures.set(job.key, Date.now() + 10 * 60 * 1000);
+        routeFailures.set(job.key, Date.now() + ROUTE_RETRY_MS);
         job.resolve(null);
       }).finally(() => {
         activeRouteRequests--;
@@ -491,7 +496,7 @@
   }
 
   function requestRailRoute(feature) {
-    if (routeServiceBlockedReason) return;
+    if (!mapVisible || document.hidden || routeServiceBlockedReason) return;
     const key = railRouteKey(feature);
     if (pendingRouteRequests.has(key) || (routeFailures.get(key) || 0) > Date.now()) return;
     const { promise, resolve } = Promise.withResolvers();
@@ -513,6 +518,14 @@
       }
     }).finally(() => pendingRouteRequests.delete(key));
     return promise;
+  }
+
+  // lazy load routes once tab is visible
+  function requestMissingRoutes() {
+    for (const { line } of routeLayersByKey.values()) {
+      if (line && !routeGeometryCache.has(railRouteKey(line.feature))) requestRailRoute(line.feature);
+    }
+    processRouteQueue();
   }
 
   function cancelQueuedRoutes() {
@@ -876,6 +889,7 @@
     window.clearTimeout(mapUpdateTimer);
     mapUpdateTimer = window.setTimeout(() => { mapUpdateTimer = null; if (mapVisible) renderMap(); }, 400);
   }
+  document.addEventListener("visibilitychange", () => { if (!document.hidden) requestMissingRoutes(); });
   rememberCards(document.documentElement);
 
   // update the map as the results load
@@ -902,7 +916,6 @@
     if (routesChanged) scheduleMapUpdate();
   });
 
-  let mapUpdateTimer;
   observer.observe(document.documentElement, {
     childList: true, characterData: true, subtree: true, attributes: true,
     attributeFilter: [
